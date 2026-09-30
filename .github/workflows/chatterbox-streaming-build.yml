@@ -1,0 +1,106 @@
+# Experimental GHA: CrispASR Chatterbox S3GenStreamer + T3 Vulkan scheduler fix
+#
+# Base: CrispStrobe/CrispASR 3b93758f9725d400eca82976f895e4cec3f31260
+# Includes:
+#   - ggml_backend_sched_apply_src_mutations (T3 Vulkan ownership fix)
+#   - ggml_vk_abort_if_not_vk_buffer diagnostic guard
+#   - Chatterbox S3GenStreamer / CAP_STREAMING (CRISPASR_CHATTERBOX_STREAM=1)
+#
+# Flags match .github/workflows/release.yml build-windows-vulkan at 3b93758.
+# Dispatch with workflow_dispatch on an isolated branch only.
+
+name: Chatterbox streaming Phase 2 build
+
+on:
+  workflow_dispatch:
+
+jobs:
+  windows-vulkan-x64:
+    runs-on: windows-2022
+    env:
+      BASE_COMMIT: 3b93758f9725d400eca82976f895e4cec3f31260
+    steps:
+      - name: Checkout patched branch
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Require scheduler fix + streamer on known base
+        shell: pwsh
+        run: |
+          git cat-file -t $env:BASE_COMMIT
+          git merge-base --is-ancestor $env:BASE_COMMIT HEAD
+          if (-not (Select-String -Path ggml\src\ggml-backend.cpp -Pattern "ggml_backend_sched_apply_src_mutations" -Quiet)) {
+            throw "scheduler fix is not in this tree"
+          }
+          if (-not (Select-String -Path ggml\src\ggml-vulkan\ggml-vulkan.cpp -Pattern "ggml_vk_abort_if_not_vk_buffer" -Quiet)) {
+            throw "vulkan diagnostic guard is not in this tree"
+          }
+          if (-not (Select-String -Path src\chatterbox_s3gen.h -Pattern "chatterbox_s3gen_streamer_create" -Quiet)) {
+            throw "streamer API missing from chatterbox_s3gen.h"
+          }
+          if (-not (Select-String -Path examples\cli\crispasr_backend_chatterbox.cpp -Pattern "CRISPASR_CHATTERBOX_STREAM" -Quiet)) {
+            throw "CAP_STREAMING opt-in missing from chatterbox backend"
+          }
+          Write-Host "HEAD $(git rev-parse HEAD)"
+          Write-Host "BASE $env:BASE_COMMIT"
+
+      - name: Install Vulkan SDK
+        shell: pwsh
+        run: |
+          $ver = (Invoke-RestMethod -Uri "https://vulkan.lunarg.com/sdk/latest.json").windows
+          Write-Host "Vulkan SDK $ver"
+          $url = "https://sdk.lunarg.com/sdk/download/$ver/windows/vulkan_sdk.exe"
+          Invoke-WebRequest -Uri $url -OutFile vulkan_sdk.exe
+          Start-Process -FilePath .\vulkan_sdk.exe -ArgumentList "--accept-licenses","--default-answer","--confirm-command","install" -Wait
+          $sdk = "C:\VulkanSDK\$ver"
+          "VULKAN_SDK=$sdk" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "$sdk\Bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+          Set-Content -Path vulkan-sdk-version.txt -Value $ver
+
+      - name: Configure and build
+        shell: cmd
+        run: |
+          for /f "tokens=*" %%i in ('"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath') do set VSINSTALL=%%i
+          call "%VSINSTALL%\VC\Auxiliary\Build\vcvars64.bat"
+          cmake -S . -B build -G Ninja ^
+            -DCMAKE_BUILD_TYPE=Release ^
+            -DBUILD_SHARED_LIBS=ON ^
+            -DGGML_VULKAN=ON ^
+            -DGGML_CUDA=OFF ^
+            -DGGML_NATIVE=OFF ^
+            -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON ^
+            -DCRISPASR_BUILD_TESTS=OFF
+          cmake --build build --target crispasr-cli -j %NUMBER_OF_PROCESSORS%
+
+      - name: Package and hash
+        shell: pwsh
+        run: |
+          $out = "release\crispasr-windows-x86_64-vulkan-s3stream"
+          New-Item -ItemType Directory -Force $out | Out-Null
+          $bins = @("build\bin", "build\bin\Release") | Where-Object { Test-Path $_ }
+          if (-not $bins) { throw "no build bin directory" }
+          foreach ($d in $bins) {
+            Copy-Item "$d\crispasr.exe" $out -ErrorAction SilentlyContinue
+            Get-ChildItem "$d\*.dll" -ErrorAction SilentlyContinue |
+              Where-Object { $_.Name -notlike "Catch2*" } |
+              Copy-Item -Destination $out
+          }
+          if (-not (Test-Path "$out\crispasr.exe")) { throw "crispasr.exe missing" }
+          if (-not (Test-Path "$out\ggml-vulkan.dll")) { throw "ggml-vulkan.dll missing" }
+          Copy-Item vulkan-sdk-version.txt $out
+          git rev-parse HEAD | Set-Content "$out\git-head.txt"
+          Set-Content -Path "$out\CAP_STREAMING.txt" -Value "enable with CRISPASR_CHATTERBOX_STREAM=1"
+          $lines = foreach ($f in Get-ChildItem $out -File) {
+            $h = Get-FileHash $f.FullName -Algorithm SHA256
+            "{0}  {1}" -f $h.Hash, $f.Name
+          }
+          $lines | Set-Content "$out\SHA256SUMS.txt"
+          Get-Content "$out\SHA256SUMS.txt"
+          Compress-Archive -Path $out -DestinationPath release\crispasr-windows-x86_64-vulkan-s3stream.zip -CompressionLevel Optimal
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: crispasr-windows-x86_64-vulkan-s3stream
+          path: release/crispasr-windows-x86_64-vulkan-s3stream.zip
