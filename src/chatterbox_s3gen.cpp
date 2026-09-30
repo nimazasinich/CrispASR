@@ -3003,10 +3003,15 @@ static std::vector<float> run_f0_predictor(chatterbox_s3gen_context* c,
 // (if noisy) audio because the learned conv_pre/post capture the mel→wav mapping.
 
 // stage_dump: if non-null, map is filled with named stage outputs after graph compute.
+// cache_source / out_source: upstream HiFTGenerator.inference cache_source — time-domain
+// NSF source waveform (T_audio ≈ T_mel * 480). Prefix of newly generated source is
+// overwritten with cache_source before STFT; full source is returned via out_source.
 static std::vector<float> hift_vocoder_cpu(chatterbox_s3gen_context* c,
                                            const std::vector<float>& mel, // (80, T_mel) channel-first
                                            int T_mel, const float* source_stft_cf = nullptr, int T_src_ext = 0,
-                                           std::map<std::string, std::vector<float>>* stage_dump = nullptr) {
+                                           std::map<std::string, std::vector<float>>* stage_dump = nullptr,
+                                           const float* cache_source = nullptr, int n_cache_source = 0,
+                                           std::vector<float>* out_source = nullptr) {
     if (c->verbosity >= 1) {
         float mel_rms = 0, mel_min = 1e30f, mel_max = -1e30f;
         for (size_t i = 0; i < mel.size(); i++) {
@@ -3486,6 +3491,17 @@ static std::vector<float> hift_vocoder_cpu(chatterbox_s3gen_context* c,
                     source[t] = std::tanh(val);
                 }
 
+                // Upstream HiFTGenerator.inference: reuse prior source prefix so
+                // incremental vocodes do not invent a new NSF phase for frames
+                // already emitted (avoids chunk-boundary clicks).
+                if (cache_source && n_cache_source > 0) {
+                    const int n_ov = std::min(n_cache_source, T_audio);
+                    std::memcpy(source.data(), cache_source, (size_t)n_ov * sizeof(float));
+                }
+                if (out_source) {
+                    *out_source = source;
+                }
+
                 if (c->verbosity >= 1) {
                     float src_rms = 0, src_min = 1e30f, src_max = -1e30f;
                     for (auto v : source) {
@@ -3691,7 +3707,7 @@ static bool chatterbox_s3gen_compute_gen_mel(struct chatterbox_s3gen_context* ct
                                              int n_speech_tokens, const int32_t* prompt_tokens, int n_prompt_tokens,
                                              const float* prompt_feat, int prompt_feat_len, const float* spk_embedding,
                                              int n_cfm_steps, const float* init_noise_cf, int init_noise_T_total,
-                                             std::vector<float>& gen_mel_out, int* out_T_mel) {
+                                             std::vector<float>& gen_mel_out, int* out_T_mel, int finalize = 1) {
     if (!ctx || !speech_tokens || n_speech_tokens <= 0)
         return false;
     if (out_T_mel)
@@ -3710,8 +3726,8 @@ static bool chatterbox_s3gen_compute_gen_mel(struct chatterbox_s3gen_context* ct
         n_cfm_steps = is_meanflow ? 2 : 6;
 
     if (ctx->verbosity >= 1) {
-        fprintf(stderr, "s3gen: %d speech tokens + %d prompt tokens, %d CFM steps\n", n_speech_tokens, n_prompt_tokens,
-                n_cfm_steps);
+        fprintf(stderr, "s3gen: %d speech tokens + %d prompt tokens, %d CFM steps (finalize=%d)\n", n_speech_tokens,
+                n_prompt_tokens, n_cfm_steps, finalize);
     }
 
     // Check for stage dump mode (per-stage intermediate comparison)
@@ -3719,13 +3735,37 @@ static bool chatterbox_s3gen_compute_gen_mel(struct chatterbox_s3gen_context* ct
     bool dump_stages = dump_env && dump_env[0] == '1';
 
     // 1. Conformer encoder: tokens → (80, T_mel)
+    // Upstream always encodes the FULL token buffer (including lookahead), then
+    // when finalize=False trims the last pre_lookahead_len * token_mel_ratio
+    // frames from encoder output before CFM (flow.py CausalMaskedDiffWithXvec).
     int64_t t_enc0 = ggml_time_us();
     std::vector<float> h = run_conformer_encoder(ctx, speech_tokens, n_speech_tokens, prompt_tokens, n_prompt_tokens);
     ctx->last_perf.t_encoder_us = ggml_time_us() - t_enc0;
+    if (h.empty())
+        return false;
 
-    int T_mel_total = (n_prompt_tokens + n_speech_tokens) * 2; // 2x upsample
-    int T_mel_prompt = n_prompt_tokens * 2;
-    int T_mel_gen = n_speech_tokens * 2;
+    constexpr int kPreLookaheadLen = 3;
+    constexpr int kTokenMelRatio = 2;
+    int T_mel_total = (n_prompt_tokens + n_speech_tokens) * kTokenMelRatio; // 2x upsample
+    int T_mel_prompt = n_prompt_tokens * kTokenMelRatio;
+    int T_mel_gen = n_speech_tokens * kTokenMelRatio;
+    if (!finalize) {
+        const int trim = kPreLookaheadLen * kTokenMelRatio;
+        if (T_mel_gen <= trim) {
+            if (ctx->verbosity >= 1)
+                fprintf(stderr, "s3gen: finalize=0 but only %d gen frames (need >%d)\n", T_mel_gen, trim);
+            return false;
+        }
+        const int T_new = T_mel_total - trim;
+        std::vector<float> h_trim((size_t)80 * (size_t)T_new);
+        for (int b = 0; b < 80; b++) {
+            std::memcpy(&h_trim[(size_t)b * (size_t)T_new], &h[(size_t)b * (size_t)T_mel_total],
+                        (size_t)T_new * sizeof(float));
+        }
+        h = std::move(h_trim);
+        T_mel_total = T_new;
+        T_mel_gen -= trim;
+    }
     if (init_noise_cf && init_noise_T_total != T_mel_total) {
         fprintf(stderr, "s3gen: init noise T mismatch (%d != %d)\n", init_noise_T_total, T_mel_total);
         return false;
@@ -3880,13 +3920,24 @@ extern "C" float* chatterbox_s3gen_synthesize_mel_with_noise(
     struct chatterbox_s3gen_context* ctx, const int32_t* speech_tokens, int n_speech_tokens,
     const int32_t* prompt_tokens, int n_prompt_tokens, const float* prompt_feat, int prompt_feat_len,
     const float* spk_embedding, int n_cfm_steps, const float* init_noise_cf, int init_noise_T_total, int* out_T_mel) {
+    return chatterbox_s3gen_synthesize_mel_with_noise_ex(ctx, speech_tokens, n_speech_tokens, prompt_tokens,
+                                                         n_prompt_tokens, prompt_feat, prompt_feat_len, spk_embedding,
+                                                         n_cfm_steps, init_noise_cf, init_noise_T_total,
+                                                         /*finalize=*/1, out_T_mel);
+}
+
+extern "C" float* chatterbox_s3gen_synthesize_mel_with_noise_ex(
+    struct chatterbox_s3gen_context* ctx, const int32_t* speech_tokens, int n_speech_tokens,
+    const int32_t* prompt_tokens, int n_prompt_tokens, const float* prompt_feat, int prompt_feat_len,
+    const float* spk_embedding, int n_cfm_steps, const float* init_noise_cf, int init_noise_T_total, int finalize,
+    int* out_T_mel) {
     if (!ctx || !speech_tokens || n_speech_tokens <= 0 || !out_T_mel || !init_noise_cf || init_noise_T_total <= 0)
         return nullptr;
     *out_T_mel = 0;
     std::vector<float> gen_mel;
     if (!chatterbox_s3gen_compute_gen_mel(ctx, speech_tokens, n_speech_tokens, prompt_tokens, n_prompt_tokens,
                                           prompt_feat, prompt_feat_len, spk_embedding, n_cfm_steps, init_noise_cf,
-                                          init_noise_T_total, gen_mel, out_T_mel)) {
+                                          init_noise_T_total, gen_mel, out_T_mel, finalize ? 1 : 0)) {
         return nullptr;
     }
     float* out = (float*)malloc(gen_mel.size() * sizeof(float));
@@ -3987,6 +4038,42 @@ extern "C" float* chatterbox_s3gen_vocode_with_source_stft(struct chatterbox_s3g
     if (wav.empty())
         return nullptr;
     float* out = (float*)malloc(wav.size() * sizeof(float));
+    std::memcpy(out, wav.data(), wav.size() * sizeof(float));
+    *out_n_samples = (int)wav.size();
+    return out;
+}
+
+extern "C" float* chatterbox_s3gen_vocode_with_cache_source(struct chatterbox_s3gen_context* ctx, const float* mel_cf,
+                                                            int T_mel, const float* cache_source, int n_cache_source,
+                                                            float** out_source, int* out_n_source, int* out_n_samples) {
+    if (!ctx || !mel_cf || T_mel <= 0 || !out_n_samples)
+        return nullptr;
+    *out_n_samples = 0;
+    if (out_source)
+        *out_source = nullptr;
+    if (out_n_source)
+        *out_n_source = 0;
+
+    std::vector<float> mel(mel_cf, mel_cf + (size_t)80 * (size_t)T_mel);
+    std::vector<float> source_out;
+    std::vector<float> wav =
+        hift_vocoder_cpu(ctx, mel, T_mel, nullptr, 0, nullptr, cache_source, n_cache_source, &source_out);
+    apply_trim_fade(wav);
+    if (wav.empty())
+        return nullptr;
+
+    if (out_source && out_n_source && !source_out.empty()) {
+        float* src = (float*)malloc(source_out.size() * sizeof(float));
+        if (src) {
+            std::memcpy(src, source_out.data(), source_out.size() * sizeof(float));
+            *out_source = src;
+            *out_n_source = (int)source_out.size();
+        }
+    }
+
+    float* out = (float*)malloc(wav.size() * sizeof(float));
+    if (!out)
+        return nullptr;
     std::memcpy(out, wav.data(), wav.size() * sizeof(float));
     *out_n_samples = (int)wav.size();
     return out;
@@ -4235,3 +4322,267 @@ extern "C" float* chatterbox_s3gen_dump_s3tok_tokens(struct chatterbox_s3gen_con
     *out_T_tok = (int)toks.size();
     return r;
 }
+
+// ============================================================================
+// S3GenStreamer — port of resemble-ai/chatterbox streamer.py (ce5a900)
+// ============================================================================
+
+namespace {
+
+constexpr int32_t kS3genSil = 4299;
+constexpr int kStreamerPreLookahead = 3;
+constexpr int kStreamerTokenMelRatio = 2;
+constexpr int kStreamerSr = 24000;
+
+} // namespace
+
+struct chatterbox_s3gen_streamer {
+    chatterbox_s3gen_context* s3gen = nullptr;
+    std::vector<int32_t> prompt_tokens;
+    std::vector<float> prompt_feat; // row-major (T, 80)
+    int prompt_feat_len = 0;
+    std::vector<float> spk_embedding; // 192
+    int n_cfm_steps = 0;
+    int crossfade_samples = 0;
+
+    std::vector<int32_t> token_buffer;
+    // Stable gen-region CFM noise only (80 * T_gen), channel-first — matches
+    // upstream CausalConditionalCFM noised_mels overwrite of z[..., prompt_len:].
+    std::vector<float> noised_gen; // size = 80 * T_gen_frames
+    int noised_gen_frames = 0;
+    std::vector<float> hift_cache_source;
+    std::vector<float> pending_tail;
+    int emitted_samples = 0;
+    int generated_tokens = 0;
+    int decoded_chunks = 0;
+    bool finished = false;
+    volatile int* cancel_flag = nullptr;
+
+    bool cancelled() const { return cancel_flag && *cancel_flag; }
+};
+
+extern "C" struct chatterbox_s3gen_streamer* chatterbox_s3gen_streamer_create(
+    struct chatterbox_s3gen_context* s3gen, const int32_t* prompt_tokens, int n_prompt_tokens,
+    const float* prompt_feat, int prompt_feat_len, const float* spk_embedding, int n_cfm_steps, float crossfade_ms) {
+    if (!s3gen)
+        return nullptr;
+    auto* st = new chatterbox_s3gen_streamer();
+    st->s3gen = s3gen;
+    st->n_cfm_steps = n_cfm_steps;
+    st->crossfade_samples = std::max(0, (int)(kStreamerSr * crossfade_ms / 1000.0f));
+    if (prompt_tokens && n_prompt_tokens > 0)
+        st->prompt_tokens.assign(prompt_tokens, prompt_tokens + n_prompt_tokens);
+    if (prompt_feat && prompt_feat_len > 0) {
+        st->prompt_feat_len = prompt_feat_len;
+        st->prompt_feat.assign(prompt_feat, prompt_feat + (size_t)prompt_feat_len * 80);
+    }
+    if (spk_embedding)
+        st->spk_embedding.assign(spk_embedding, spk_embedding + 192);
+    return st;
+}
+
+extern "C" void chatterbox_s3gen_streamer_free(struct chatterbox_s3gen_streamer* st) {
+    delete st;
+}
+
+extern "C" void chatterbox_s3gen_streamer_set_cancel_flag(struct chatterbox_s3gen_streamer* st, volatile int* flag) {
+    if (st)
+        st->cancel_flag = flag;
+}
+
+extern "C" int chatterbox_s3gen_streamer_append(struct chatterbox_s3gen_streamer* st, const int32_t* tokens,
+                                                int n_tokens) {
+    if (!st || st->finished || !tokens || n_tokens <= 0)
+        return -1;
+    if (st->cancelled())
+        return -2;
+    st->token_buffer.insert(st->token_buffer.end(), tokens, tokens + n_tokens);
+    st->generated_tokens += n_tokens;
+    return 0;
+}
+
+static void streamer_ensure_gen_noise(chatterbox_s3gen_streamer* st, int mel_frames) {
+    if (mel_frames <= 0)
+        return;
+    if (st->noised_gen_frames == 0) {
+        st->noised_gen.resize((size_t)80 * (size_t)mel_frames);
+        fill_gaussian_noise(st->noised_gen.data(), (int)st->noised_gen.size(), st->s3gen->noise_rng);
+        st->noised_gen_frames = mel_frames;
+        return;
+    }
+    if (st->noised_gen_frames >= mel_frames)
+        return;
+    const int extra = mel_frames - st->noised_gen_frames;
+    std::vector<float> grown((size_t)80 * (size_t)mel_frames);
+    for (int b = 0; b < 80; b++) {
+        std::memcpy(&grown[(size_t)b * (size_t)mel_frames],
+                    &st->noised_gen[(size_t)b * (size_t)st->noised_gen_frames],
+                    (size_t)st->noised_gen_frames * sizeof(float));
+        fill_gaussian_noise(&grown[(size_t)b * (size_t)mel_frames + st->noised_gen_frames], extra,
+                            st->s3gen->noise_rng);
+    }
+    st->noised_gen = std::move(grown);
+    st->noised_gen_frames = mel_frames;
+}
+
+static std::vector<float> streamer_join_crossfade(const std::vector<float>& left, const std::vector<float>& right,
+                                                  int crossfade_samples) {
+    const int overlap = std::min(crossfade_samples, std::min((int)left.size(), (int)right.size()));
+    if (overlap <= 0) {
+        std::vector<float> out = left;
+        out.insert(out.end(), right.begin(), right.end());
+        return out;
+    }
+    std::vector<float> out;
+    out.reserve(left.size() + right.size() - (size_t)overlap);
+    if ((int)left.size() > overlap)
+        out.insert(out.end(), left.begin(), left.end() - overlap);
+    for (int i = 0; i < overlap; i++) {
+        const float fo = 1.0f - (float)i / (float)std::max(overlap - 1, 1);
+        const float fi = 1.0f - fo;
+        out.push_back(left[(size_t)left.size() - (size_t)overlap + (size_t)i] * fo + right[(size_t)i] * fi);
+    }
+    if ((int)right.size() > overlap)
+        out.insert(out.end(), right.begin() + overlap, right.end());
+    return out;
+}
+
+static std::vector<float> streamer_decode_available(chatterbox_s3gen_streamer* st, int finalize) {
+    if (!st || st->token_buffer.empty() || st->cancelled())
+        return {};
+
+    int effective = (int)st->token_buffer.size();
+    if (!finalize) {
+        if (effective <= kStreamerPreLookahead)
+            return {};
+        effective -= kStreamerPreLookahead;
+    }
+    if (effective <= 0)
+        return {};
+
+    const int gen_frames = effective * kStreamerTokenMelRatio;
+    const int T_mel_prompt = (int)st->prompt_tokens.size() * kStreamerTokenMelRatio;
+    const int T_mel_total = T_mel_prompt + gen_frames;
+    streamer_ensure_gen_noise(st, gen_frames);
+
+    // Full latent: fresh prompt noise + stable gen noise (upstream CFM).
+    std::vector<float> init_noise((size_t)80 * (size_t)T_mel_total);
+    fill_gaussian_noise(init_noise.data(), (int)init_noise.size(), st->s3gen->noise_rng);
+    for (int b = 0; b < 80; b++) {
+        std::memcpy(&init_noise[(size_t)b * (size_t)T_mel_total + (size_t)T_mel_prompt],
+                    &st->noised_gen[(size_t)b * (size_t)st->noised_gen_frames],
+                    (size_t)gen_frames * sizeof(float));
+    }
+
+    int T_mel = 0;
+    float* mel_cf = chatterbox_s3gen_synthesize_mel_with_noise_ex(
+        st->s3gen, st->token_buffer.data(), (int)st->token_buffer.size(),
+        st->prompt_tokens.empty() ? nullptr : st->prompt_tokens.data(), (int)st->prompt_tokens.size(),
+        st->prompt_feat.empty() ? nullptr : st->prompt_feat.data(), st->prompt_feat_len,
+        st->spk_embedding.empty() ? nullptr : st->spk_embedding.data(), st->n_cfm_steps, init_noise.data(),
+        T_mel_total, finalize ? 1 : 0, &T_mel);
+    if (!mel_cf || T_mel <= 0) {
+        if (mel_cf)
+            chatterbox_s3gen_pcm_free(mel_cf);
+        return {};
+    }
+    if (st->cancelled()) {
+        chatterbox_s3gen_pcm_free(mel_cf);
+        return {};
+    }
+
+    float* source_ptr = nullptr;
+    int n_source = 0;
+    int n_wav = 0;
+    float* wav = chatterbox_s3gen_vocode_with_cache_source(
+        st->s3gen, mel_cf, T_mel, st->hift_cache_source.empty() ? nullptr : st->hift_cache_source.data(),
+        (int)st->hift_cache_source.size(), &source_ptr, &n_source, &n_wav);
+    chatterbox_s3gen_pcm_free(mel_cf);
+    if (source_ptr && n_source > 0) {
+        st->hift_cache_source.assign(source_ptr, source_ptr + n_source);
+        chatterbox_s3gen_pcm_free(source_ptr);
+    }
+    if (!wav || n_wav <= 0) {
+        if (wav)
+            chatterbox_s3gen_pcm_free(wav);
+        return {};
+    }
+    if (n_wav <= st->emitted_samples) {
+        chatterbox_s3gen_pcm_free(wav);
+        return {};
+    }
+    std::vector<float> delta(wav + st->emitted_samples, wav + n_wav);
+    chatterbox_s3gen_pcm_free(wav);
+    st->decoded_chunks += 1;
+    return delta;
+}
+
+extern "C" float* chatterbox_s3gen_streamer_flush(struct chatterbox_s3gen_streamer* st, int finalize,
+                                                  int* out_n_samples) {
+    if (!out_n_samples)
+        return nullptr;
+    *out_n_samples = 0;
+    if (!st || st->cancelled())
+        return nullptr;
+
+    std::vector<float> chunk = streamer_decode_available(st, finalize ? 1 : 0);
+    if (chunk.empty())
+        return nullptr;
+
+    const int chunk_len = (int)chunk.size();
+    if (st->crossfade_samples <= 0) {
+        st->emitted_samples += chunk_len;
+        float* out = (float*)malloc((size_t)chunk_len * sizeof(float));
+        if (!out)
+            return nullptr;
+        std::memcpy(out, chunk.data(), (size_t)chunk_len * sizeof(float));
+        *out_n_samples = chunk_len;
+        return out;
+    }
+
+    if (!finalize && chunk_len <= st->crossfade_samples)
+        return nullptr;
+
+    std::vector<float> output;
+    if (finalize) {
+        output = chunk;
+        if (!st->pending_tail.empty())
+            output = streamer_join_crossfade(st->pending_tail, chunk, st->crossfade_samples);
+        st->pending_tail.clear();
+        st->emitted_samples += chunk_len;
+    } else {
+        const int emit_len = chunk_len - st->crossfade_samples;
+        std::vector<float> body(chunk.begin(), chunk.begin() + emit_len);
+        std::vector<float> new_tail(chunk.begin() + emit_len, chunk.end());
+        if (!st->pending_tail.empty())
+            output = streamer_join_crossfade(st->pending_tail, body, st->crossfade_samples);
+        else
+            output = std::move(body);
+        st->pending_tail = std::move(new_tail);
+        st->emitted_samples += emit_len;
+    }
+
+    if (output.empty())
+        return nullptr;
+    float* out = (float*)malloc(output.size() * sizeof(float));
+    if (!out)
+        return nullptr;
+    std::memcpy(out, output.data(), output.size() * sizeof(float));
+    *out_n_samples = (int)output.size();
+    return out;
+}
+
+extern "C" float* chatterbox_s3gen_streamer_finish(struct chatterbox_s3gen_streamer* st, int* out_n_samples) {
+    if (!out_n_samples)
+        return nullptr;
+    *out_n_samples = 0;
+    if (!st)
+        return nullptr;
+    if (!st->finished) {
+        const int32_t sil[3] = {kS3genSil, kS3genSil, kS3genSil};
+        st->token_buffer.insert(st->token_buffer.end(), sil, sil + 3);
+        st->finished = true;
+    }
+    return chatterbox_s3gen_streamer_flush(st, /*finalize=*/1, out_n_samples);
+}
+

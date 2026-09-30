@@ -771,16 +771,26 @@ struct ggml_backend_sched_split {
     struct ggml_cgraph graph;
 };
 
-// Per-call record of src[j] mutations made by
-// ggml_backend_sched_split_graph. Without restoration, repeated
-// sched_alloc_graph calls on the same user graph leave node->src[j]
-// pointing at input_cpy tensors that lived in the previous sched->ctx
-// (which is freed+reinit'd at the start of every split_graph call), so
-// the next call's input-detection loop misses the original
-// GGML_TENSOR_FLAG_INPUT tensors and sched never queues the CPU->GPU
-// copy of inputs the second time. Repro: CFG-style decoders running
-// the same gf twice per step (cond + uncond) silently use stale GPU
-// buffers on the second call.
+// Record of src[j] rewires made by ggml_backend_sched_split_graph.
+//
+// split_graph points a GPU node's src at a backend-local copy, then
+// compute_splits fills that copy from the original (often a CPU graph
+// input). The user graph must be restored to the original src before the
+// next split_graph, because that call frees sched->ctx. Leaving the rewire
+// in place makes the next split miss GGML_TENSOR_FLAG_INPUT and skip the
+// CPU->GPU copy. Repro of that older bug: CFG decoders that alloc the same
+// gf twice per step.
+//
+// Restoring at the end of compute and then NOT re-applying the rewire is
+// also wrong. ggml_backend_sched_graph_compute_async skips split_graph
+// while sched->is_alloc stays true (cached graphs: T3 Lk buckets). The
+// copy is still filled every compute, but the node keeps reading the
+// original CPU tensor. Repro: second AR step of a bucketed T3 graph,
+// fused RMS_NORM+MUL, src inputs_embeds.
+//
+// So the records outlive a single compute. Each compute applies them
+// before the kernels and restores the user pointers afterwards. They are
+// discarded only when the copy tensors die (split_graph / sched_reset).
 struct ggml_backend_sched_src_mutation {
     struct ggml_tensor * node;
     struct ggml_tensor * orig_src;
@@ -1045,8 +1055,9 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
     sched->n_graph_inputs = 0;
     sched->is_reset = false;
 
-    // The mutation records point into sched->ctx. Before rebuilding that
-    // context, restore the user's graph and discard the old records.
+    // Drop rewires from the previous graph. The copy tensors live in
+    // sched->ctx, which is freed just below, so the records must not
+    // survive this call. Restoring writes to the user's gf.
     ggml_backend_sched_discard_src_mutations(sched);
 
     struct ggml_init_params params = {
@@ -1411,15 +1422,13 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                         sched->src_mutations = resized;
                         sched->src_mutations_capacity = new_capacity;
                     }
-                    struct ggml_tensor * copy_src =
-                        tensor_id_copy(src_id, cur_backend_id, sched->cur_copy);
                     sched->src_mutations[sched->n_src_mutations].node = node;
                     sched->src_mutations[sched->n_src_mutations].orig_src = src;
-                    sched->src_mutations[sched->n_src_mutations].copy_src = copy_src;
+                    sched->src_mutations[sched->n_src_mutations].copy_src = tensor_id_copy(src_id, cur_backend_id, sched->cur_copy);
                     sched->src_mutations[sched->n_src_mutations].j = j;
                     sched->n_src_mutations++;
 
-                    node->src[j] = copy_src;
+                    node->src[j] = sched->src_mutations[sched->n_src_mutations - 1].copy_src;
                 }
             }
         }
@@ -1590,10 +1599,8 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
     return true;
 }
 
-// Re-apply the cross-backend src[j] rewires recorded by split_graph.
-// Cached graphs keep their split input copies allocated across computes,
-// so every compute must point the node back at those copies before any
-// backend kernel runs.
+// Point node->src[j] at the backend-local copy. Idempotent.
+// The copy tensor must still be alive (same sched->ctx / same is_alloc).
 static void ggml_backend_sched_apply_src_mutations(ggml_backend_sched_t sched) {
     for (int i = 0; i < sched->n_src_mutations; i++) {
         const struct ggml_backend_sched_src_mutation * m = &sched->src_mutations[i];
@@ -1601,8 +1608,9 @@ static void ggml_backend_sched_apply_src_mutations(ggml_backend_sched_t sched) {
     }
 }
 
-// Restore the user's graph after a compute without forgetting the rewire
-// records. This keeps cached alloc-once/compute-many graphs valid.
+// Point node->src[j] back at the user's original tensor. Idempotent.
+// Keeps the records so a later compute of the same allocated graph can
+// apply them again. Does not free anything.
 static void ggml_backend_sched_restore_src_mutations(ggml_backend_sched_t sched) {
     for (int i = 0; i < sched->n_src_mutations; i++) {
         const struct ggml_backend_sched_src_mutation * m = &sched->src_mutations[i];
@@ -1610,8 +1618,9 @@ static void ggml_backend_sched_restore_src_mutations(ggml_backend_sched_t sched)
     }
 }
 
-// Restore and forget rewires only when their backing scheduler context is
-// about to be rebuilt or reset.
+// Restore user pointers and forget the records. Required before
+// sched->ctx is freed (split_graph) and on sched_reset, because the
+// copy tensors are no longer valid after that.
 static void ggml_backend_sched_discard_src_mutations(ggml_backend_sched_t sched) {
     ggml_backend_sched_restore_src_mutations(sched);
     sched->n_src_mutations = 0;
@@ -1619,8 +1628,12 @@ static void ggml_backend_sched_discard_src_mutations(ggml_backend_sched_t sched)
 
 static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
-    ggml_backend_sched_apply_src_mutations(sched);
     struct ggml_backend_sched_split * splits = sched->splits;
+
+    // Cached graphs (is_alloc, no new split) restored these pointers at
+    // the end of the previous compute. Re-apply before the kernels so
+    // every backend reads its copy, not the original CPU input.
+    ggml_backend_sched_apply_src_mutations(sched);
 
     ggml_tensor * prev_ids_tensor = nullptr;
     std::vector<int32_t> ids;

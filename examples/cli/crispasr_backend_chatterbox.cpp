@@ -11,7 +11,6 @@
 
 #include "chatterbox.h"
 
-#include <algorithm>
 #include <cctype>
 #include <cstdio>
 #include <cstdlib>
@@ -113,8 +112,11 @@ public:
 
     uint32_t capabilities() const override {
         uint32_t caps = CAP_TTS | CAP_AUTO_DOWNLOAD | CAP_TEMPERATURE | CAP_FLASH_ATTN | CAP_VOICE_CLONING;
-        const char* stream = std::getenv("CRISPASR_CHATTERBOX_STREAM");
-        if (stream && stream[0] && stream[0] != '0')
+        // Opt-in only: CRISPASR_CHATTERBOX_STREAM=1 advertises CAP_STREAMING so the
+        // server uses synthesize_streaming(). Sync synthesize() remains the default
+        // when the env is unset / "0".
+        const char* stream_env = std::getenv("CRISPASR_CHATTERBOX_STREAM");
+        if (stream_env && stream_env[0] && stream_env[0] != '0')
             caps |= CAP_STREAMING;
         return caps;
     }
@@ -210,28 +212,20 @@ public:
 
     void synthesize_streaming(const std::string& text, const whisper_params& params,
                               crispasr_pcm_stream_callback cb) override {
-        const char* stream_env = std::getenv("CRISPASR_CHATTERBOX_STREAM");
-        if (!stream_env || !stream_env[0] || stream_env[0] == '0') {
-            CrispasrBackend::synthesize_streaming(text, params, std::move(cb));
-            return;
-        }
         if (!ctx_ || text.empty())
             return;
         if (!s3gen_loaded_) {
             fprintf(stderr, "crispasr[chatterbox]: S3Gen not loaded. Pass --codec-model <s3gen.gguf>\n");
             return;
         }
-
+        // Mirror synthesize() voice / sampling setup so stream and sync share knobs.
         if (!params.tts_voice.empty() && params.tts_voice != last_voice_key_) {
             if (chatterbox_set_voice_from_wav(ctx_, params.tts_voice.c_str()) == 0) {
                 last_voice_key_ = params.tts_voice;
-                if (!params.no_prints)
-                    fprintf(stderr, "crispasr[chatterbox]: voice '%s' loaded\n", params.tts_voice.c_str());
             } else {
                 return;
             }
         }
-
         chatterbox_set_seed(ctx_, (uint32_t)params.seed);
         if (!params.language.empty() && params.language != "auto")
             chatterbox_set_language(ctx_, params.language.c_str());
@@ -256,18 +250,14 @@ public:
         if (params.temperature > 0.0f)
             chatterbox_set_temperature(ctx_, params.temperature);
 
-        int chunk_tokens = 24;
-        if (const char* e = std::getenv("CRISPASR_CHATTERBOX_STREAM_CHUNK_TOKENS"); e && *e)
-            chunk_tokens = std::max(4, std::atoi(e));
-
         auto trampoline = [](const float* pcm, int n_samples, int is_final, void* user_data) {
             auto* fn = static_cast<crispasr_pcm_stream_callback*>(user_data);
             if (n_samples > 0 || is_final)
                 (*fn)(pcm, n_samples, is_final != 0);
         };
-
         int n = 0;
-        float* full = chatterbox_synthesize_streaming(ctx_, text.c_str(), chunk_tokens, trampoline, &cb, &n);
+        // chunk_tokens=24 matches upstream Turbo stream() default.
+        float* full = chatterbox_synthesize_streaming(ctx_, text.c_str(), 24, trampoline, &cb, nullptr, &n);
         chatterbox_pcm_free(full);
     }
 

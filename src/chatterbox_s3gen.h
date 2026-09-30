@@ -61,6 +61,18 @@ float* chatterbox_s3gen_synthesize_mel_with_noise(struct chatterbox_s3gen_contex
                                                   const float* spk_embedding, int n_cfm_steps,
                                                   const float* init_noise_cf, int init_noise_T_total, int* out_T_mel);
 
+// Streaming-capable mel decode. When finalize==0, drops the last
+// pre_lookahead_len(=3) * token_mel_ratio(=2) = 6 encoder mel frames so the
+// causal pre-lookahead is not forced to invent future context (upstream
+// CausalMaskedDiffWithXvec.inference). init_noise_cf is the FULL latent
+// (prompt + gen), channel-first 80 * T_total after the finalize trim.
+float* chatterbox_s3gen_synthesize_mel_with_noise_ex(struct chatterbox_s3gen_context* ctx, const int32_t* speech_tokens,
+                                                     int n_speech_tokens, const int32_t* prompt_tokens,
+                                                     int n_prompt_tokens, const float* prompt_feat,
+                                                     int prompt_feat_len, const float* spk_embedding, int n_cfm_steps,
+                                                     const float* init_noise_cf, int init_noise_T_total, int finalize,
+                                                     int* out_T_mel);
+
 // Run only the vocoder on externally-provided mel.
 // mel_cf: channel-first (80 * T_mel) float array.
 float* chatterbox_s3gen_vocode(struct chatterbox_s3gen_context* ctx, const float* mel_cf, int T_mel,
@@ -71,6 +83,40 @@ float* chatterbox_s3gen_vocode(struct chatterbox_s3gen_context* ctx, const float
 // channel-first layout (18 * T_src).
 float* chatterbox_s3gen_vocode_with_source_stft(struct chatterbox_s3gen_context* ctx, const float* mel_cf, int T_mel,
                                                 const float* source_stft_cf, int T_src, int* out_n_samples);
+
+// HiFT with upstream-style cache_source (time-domain source waveform).
+// Overwrites the newly computed source prefix with cache_source, then STFTs.
+// On success *out_source receives malloc'd full source (n_samples at audio
+// rate ≈ T_mel*480); caller frees with chatterbox_s3gen_pcm_free.
+float* chatterbox_s3gen_vocode_with_cache_source(struct chatterbox_s3gen_context* ctx, const float* mel_cf, int T_mel,
+                                                 const float* cache_source, int n_cache_source, float** out_source,
+                                                 int* out_n_source, int* out_n_samples);
+
+// ── S3GenStreamer (upstream resemble-ai/chatterbox streamer.py port) ─────
+// Growing speech-token prefix → incremental mel → HiFT with cache_source →
+// ~12 ms crossfade PCM deltas. Does NOT run T3; feed tokens after full (or
+// later, incremental) T3. Sync chatterbox_s3gen_synthesize() is unchanged.
+struct chatterbox_s3gen_streamer;
+
+struct chatterbox_s3gen_streamer* chatterbox_s3gen_streamer_create(
+    struct chatterbox_s3gen_context* s3gen, const int32_t* prompt_tokens, int n_prompt_tokens,
+    const float* prompt_feat, int prompt_feat_len, const float* spk_embedding, int n_cfm_steps, float crossfade_ms);
+
+void chatterbox_s3gen_streamer_free(struct chatterbox_s3gen_streamer* st);
+
+// Optional cooperative cancel: when *flag becomes non-zero, flush/finish
+// return promptly without further CFM/HiFT work.
+void chatterbox_s3gen_streamer_set_cancel_flag(struct chatterbox_s3gen_streamer* st, volatile int* flag);
+
+int chatterbox_s3gen_streamer_append(struct chatterbox_s3gen_streamer* st, const int32_t* tokens, int n_tokens);
+
+// Decode newly stable PCM. finalize=0 holds last pre_lookahead_len tokens.
+// Returns malloc'd float PCM (caller frees with chatterbox_s3gen_pcm_free);
+// NULL / *out_n_samples==0 if nothing ready.
+float* chatterbox_s3gen_streamer_flush(struct chatterbox_s3gen_streamer* st, int finalize, int* out_n_samples);
+
+// Append three S3GEN_SIL tokens and finalize=1 flush.
+float* chatterbox_s3gen_streamer_finish(struct chatterbox_s3gen_streamer* st, int* out_n_samples);
 
 // Run vocoder and dump per-stage intermediate outputs.
 // stage_names: array of C strings (e.g. "voc_conv_pre", "voc_ups_0", ...),
