@@ -1,50 +1,48 @@
-# Experimental GHA: CrispASR Chatterbox S3GenStreamer + T3 Vulkan scheduler fix
-#
-# Base: CrispStrobe/CrispASR 3b93758f9725d400eca82976f895e4cec3f31260
-# Includes:
-#   - ggml_backend_sched_apply_src_mutations (T3 Vulkan ownership fix)
-#   - ggml_vk_abort_if_not_vk_buffer diagnostic guard
-#   - Chatterbox S3GenStreamer / CAP_STREAMING (CRISPASR_CHATTERBOX_STREAM=1)
-#
-# Flags match .github/workflows/release.yml build-windows-vulkan at 3b93758.
-# Dispatch with workflow_dispatch on an isolated branch only.
-
 name: Chatterbox streaming Phase 2 build
 
 on:
+  push:
+    branches:
+      - chatterbox-streaming-phase2
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
-  windows-vulkan-x64:
+  build-windows-vulkan:
     runs-on: windows-2022
     env:
       BASE_COMMIT: 3b93758f9725d400eca82976f895e4cec3f31260
     steps:
-      - name: Checkout patched branch
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
+          ref: ${{ github.ref }}
           submodules: recursive
           fetch-depth: 0
 
-      - name: Require scheduler fix + streamer on known base
+      - name: Verify scheduler fix + full streamer sources
         shell: pwsh
         run: |
           git cat-file -t $env:BASE_COMMIT
           git merge-base --is-ancestor $env:BASE_COMMIT HEAD
           if (-not (Select-String -Path ggml\src\ggml-backend.cpp -Pattern "ggml_backend_sched_apply_src_mutations" -Quiet)) {
-            throw "scheduler fix is not in this tree"
+            throw "T3 scheduler rewire fix is missing"
           }
           if (-not (Select-String -Path ggml\src\ggml-vulkan\ggml-vulkan.cpp -Pattern "ggml_vk_abort_if_not_vk_buffer" -Quiet)) {
             throw "vulkan diagnostic guard is not in this tree"
           }
           if (-not (Select-String -Path src\chatterbox_s3gen.h -Pattern "chatterbox_s3gen_streamer_create" -Quiet)) {
-            throw "streamer API missing from chatterbox_s3gen.h"
+            throw "S3GenStreamer API missing"
           }
-          if (-not (Select-String -Path examples\cli\crispasr_backend_chatterbox.cpp -Pattern "CRISPASR_CHATTERBOX_STREAM" -Quiet)) {
+          if (-not (Select-String -Path src\chatterbox.cpp -Pattern "chatterbox_synthesize_streaming" -Quiet)) {
+            throw "chatterbox_synthesize_streaming missing"
+          }
+          $be = Get-Content "examples/cli/crispasr_backend_chatterbox.cpp" -Raw
+          if ($be -notmatch "CRISPASR_CHATTERBOX_STREAM" -or $be -notmatch "CAP_STREAMING") {
             throw "CAP_STREAMING opt-in missing from chatterbox backend"
           }
           Write-Host "HEAD $(git rev-parse HEAD)"
-          Write-Host "BASE $env:BASE_COMMIT"
 
       - name: Install Vulkan SDK
         shell: pwsh
@@ -89,7 +87,7 @@ jobs:
           }
           if (-not (Test-Path "$out\crispasr.exe")) { throw "crispasr.exe missing" }
           if (-not (Test-Path "$out\ggml-vulkan.dll")) { throw "ggml-vulkan.dll missing" }
-          Copy-Item vulkan-sdk-version.txt $out
+          Copy-Item vulkan-sdk-version.txt $out -ErrorAction SilentlyContinue
           git rev-parse HEAD | Set-Content "$out\git-head.txt"
           Set-Content -Path "$out\CAP_STREAMING.txt" -Value "enable with CRISPASR_CHATTERBOX_STREAM=1"
           $lines = foreach ($f in Get-ChildItem $out -File) {
@@ -104,3 +102,4 @@ jobs:
         with:
           name: crispasr-windows-x86_64-vulkan-s3stream
           path: release/crispasr-windows-x86_64-vulkan-s3stream.zip
+          if-no-files-found: error
