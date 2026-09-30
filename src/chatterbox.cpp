@@ -3926,6 +3926,161 @@ extern "C" float* chatterbox_synthesize_mel_from_tokens_with_noise(struct chatte
         ctx->params.cfm_steps, init_noise_cf, init_noise_T_total, out_T_mel);
 }
 
+// Experimental Phase-2 streaming path: keep the existing synchronous synth
+// untouched, but expose PCM before the complete S3Gen pass has finished.
+//
+// The current T3 implementation still completes first. We then evaluate S3Gen
+// over growing token prefixes. Non-final windows hold back three speech tokens
+// (matching upstream streaming lookahead) and use slices of one fixed Gaussian
+// latent so already-stable CFM regions do not get a fresh noise draw. HiFT is
+// re-evaluated on the growing stable prefix for now; only the newly-stable tail
+// is emitted. Holding 12 ms at each boundary lets the next prefix crossfade the
+// boundary rather than publishing an edge that may still move.
+//
+// This deliberately favors correctness/isolation over throughput. A later T3
+// iterator + stateful HiFT cache can remove the remaining repeated work without
+// changing this callback contract.
+extern "C" float* chatterbox_synthesize_streaming(struct chatterbox_context* ctx, const char* text, int chunk_tokens,
+                                                   chatterbox_pcm_stream_callback cb, void* user_data,
+                                                   int* out_n_samples) {
+    if (!ctx || !text || !*text || !out_n_samples)
+        return nullptr;
+    *out_n_samples = 0;
+
+    if (chunk_tokens <= 0)
+        chunk_tokens = 24;
+    chunk_tokens = std::max(4, chunk_tokens);
+
+    int n_tokens = 0;
+    int32_t* raw_tokens = chatterbox_synthesize_tokens(ctx, text, &n_tokens);
+    if (!raw_tokens || n_tokens <= 0) {
+        chatterbox_tokens_free(raw_tokens);
+        return nullptr;
+    }
+    std::vector<int32_t> speech_tokens(raw_tokens, raw_tokens + n_tokens);
+    chatterbox_tokens_free(raw_tokens);
+
+    const int n_prompt = ctx->conds.gen_prompt_token ? (int)ctx->conds.gen_prompt_token->ne[0] : 0;
+    const int T_full = 2 * (n_prompt + n_tokens);
+
+    // One deterministic latent for the complete utterance. Every prefix gets
+    // the channel-wise prefix of this same tensor.
+    std::mt19937 noise_rng(ctx->rng_seed ^ 0x53334745u);
+    std::normal_distribution<float> gaussian(0.0f, 1.0f);
+    std::vector<float> full_noise((size_t)80 * (size_t)T_full);
+    for (int c = 0; c < 80; ++c) {
+        for (int t = 0; t < T_full; ++t) {
+            full_noise[(size_t)c * (size_t)T_full + (size_t)t] = gaussian(noise_rng);
+        }
+    }
+
+    constexpr int kLookaheadTokens = 3;
+    constexpr int kCrossfadeSamples = 288; // 12 ms at 24 kHz
+
+    std::vector<float> output;
+    std::vector<float> pending_tail;
+    size_t emitted_until = 0;
+    int last_stable_tokens = 0;
+
+    auto publish = [&](const std::vector<float>& chunk, bool is_final) {
+        if (!chunk.empty()) {
+            output.insert(output.end(), chunk.begin(), chunk.end());
+        }
+        if (cb && (!chunk.empty() || is_final)) {
+            cb(chunk.empty() ? nullptr : chunk.data(), (int)chunk.size(), is_final ? 1 : 0, user_data);
+        }
+    };
+
+    for (int prefix_end = std::min(chunk_tokens, n_tokens);; prefix_end = std::min(prefix_end + chunk_tokens, n_tokens)) {
+        const bool is_final = prefix_end >= n_tokens;
+        const int stable_tokens = is_final ? n_tokens : std::max(1, prefix_end - kLookaheadTokens);
+        if (!is_final && stable_tokens <= last_stable_tokens) {
+            if (prefix_end >= n_tokens)
+                break;
+            continue;
+        }
+        last_stable_tokens = stable_tokens;
+
+        const int T_cur = 2 * (n_prompt + stable_tokens);
+        std::vector<float> prefix_noise((size_t)80 * (size_t)T_cur);
+        for (int c = 0; c < 80; ++c) {
+            std::memcpy(prefix_noise.data() + (size_t)c * (size_t)T_cur,
+                        full_noise.data() + (size_t)c * (size_t)T_full,
+                        (size_t)T_cur * sizeof(float));
+        }
+
+        int T_mel = 0;
+        float* mel = chatterbox_synthesize_mel_from_tokens_with_noise(
+            ctx, speech_tokens.data(), stable_tokens, prefix_noise.data(), T_cur, &T_mel);
+        if (!mel || T_mel <= 0) {
+            free(mel);
+            return nullptr;
+        }
+
+        int n_pcm = 0;
+        float* pcm_raw = chatterbox_vocode_mel(ctx, mel, T_mel, &n_pcm);
+        free(mel);
+        if (!pcm_raw || n_pcm <= 0) {
+            chatterbox_pcm_free(pcm_raw);
+            return nullptr;
+        }
+        std::vector<float> pcm(pcm_raw, pcm_raw + n_pcm);
+        chatterbox_pcm_free(pcm_raw);
+
+        size_t begin = std::min(emitted_until, pcm.size());
+        size_t limit = is_final ? pcm.size()
+                                : (pcm.size() > (size_t)kCrossfadeSamples
+                                       ? pcm.size() - (size_t)kCrossfadeSamples
+                                       : 0);
+        if (limit < begin)
+            limit = begin;
+
+        std::vector<float> emit;
+        size_t pos = begin;
+
+        // The prior call deliberately held this boundary back. Blend it with
+        // the recomputed prefix before publishing it.
+        if (!pending_tail.empty() && pos < pcm.size()) {
+            const size_t n_blend = std::min(pending_tail.size(), pcm.size() - pos);
+            emit.reserve((limit > begin ? limit - begin : 0) + n_blend);
+            for (size_t i = 0; i < n_blend; ++i) {
+                const float a = n_blend > 1 ? (float)i / (float)(n_blend - 1) : 1.0f;
+                emit.push_back(pending_tail[i] * (1.0f - a) + pcm[pos + i] * a);
+            }
+            pos += n_blend;
+        }
+
+        const size_t direct_end = is_final ? pcm.size() : limit;
+        if (pos < direct_end) {
+            emit.insert(emit.end(), pcm.begin() + (ptrdiff_t)pos, pcm.begin() + (ptrdiff_t)direct_end);
+        }
+
+        if (is_final) {
+            publish(emit, true);
+            emitted_until = pcm.size();
+            pending_tail.clear();
+            break;
+        }
+
+        publish(emit, false);
+        emitted_until = limit;
+        pending_tail.assign(pcm.begin() + (ptrdiff_t)limit, pcm.end());
+
+        if (prefix_end >= n_tokens)
+            break;
+    }
+
+    if (output.empty())
+        return nullptr;
+
+    float* out = (float*)malloc(output.size() * sizeof(float));
+    if (!out)
+        return nullptr;
+    std::memcpy(out, output.data(), output.size() * sizeof(float));
+    *out_n_samples = (int)output.size();
+    return out;
+}
+
 extern "C" float* chatterbox_vocode_mel(struct chatterbox_context* ctx, const float* mel_cf, int T_mel,
                                         int* out_n_samples) {
     return chatterbox_vocode_mel_with_source_stft(ctx, mel_cf, T_mel, nullptr, 0, out_n_samples);
