@@ -19,6 +19,7 @@
 #include "chatterbox_campplus.h"
 #include "chatterbox_s3gen.h"
 #include "chatterbox_s3tok.h"
+#include "chatterbox_gpu_select.h"
 #include "core/conv.h"
 #include "core/gguf_loader.h"
 
@@ -659,8 +660,18 @@ extern "C" struct chatterbox_s3gen_context* chatterbox_s3gen_init_from_file(cons
         if (verbosity >= 1)
             fprintf(stderr, "s3gen: CPU backend threads=%d\n", s3_threads);
     }
-    c->backend = use_gpu ? ggml_backend_init_best() : c->backend_cpu;
+    const char* s3gen_device_selector = std::getenv("CRISPASR_CHATTERBOX_S3GEN_DEVICE");
+    c->backend = use_gpu
+        ? crispasr_init_selected_gpu(s3gen_device_selector, verbosity, "chatterbox:S3Gen")
+        : c->backend_cpu;
     if (!c->backend) {
+        if (use_gpu && s3gen_device_selector && *s3gen_device_selector) {
+            fprintf(stderr,
+                    "s3gen: requested GPU '%s' is unavailable; refusing silent fallback to a different device\n",
+                    s3gen_device_selector);
+            delete c;
+            return nullptr;
+        }
         if (verbosity >= 1 && use_gpu) {
             fprintf(stderr, "s3gen: GPU backend unavailable, falling back to CPU\n");
         }
