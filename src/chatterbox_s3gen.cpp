@@ -3495,7 +3495,7 @@ static std::vector<float> hift_vocoder_cpu(chatterbox_s3gen_context* c,
                 // incremental vocodes do not invent a new NSF phase for frames
                 // already emitted (avoids chunk-boundary clicks).
                 if (cache_source && n_cache_source > 0) {
-                    const int n_ov = std::min(n_cache_source, T_audio);
+                    const int n_ov = (std::min)(n_cache_source, T_audio);
                     std::memcpy(source.data(), cache_source, (size_t)n_ov * sizeof(float));
                 }
                 if (out_source) {
@@ -4369,7 +4369,7 @@ extern "C" struct chatterbox_s3gen_streamer* chatterbox_s3gen_streamer_create(
     auto* st = new chatterbox_s3gen_streamer();
     st->s3gen = s3gen;
     st->n_cfm_steps = n_cfm_steps;
-    st->crossfade_samples = std::max(0, (int)(kStreamerSr * crossfade_ms / 1000.0f));
+    st->crossfade_samples = (std::max)(0, (int)(kStreamerSr * crossfade_ms / 1000.0f));
     if (prompt_tokens && n_prompt_tokens > 0)
         st->prompt_tokens.assign(prompt_tokens, prompt_tokens + n_prompt_tokens);
     if (prompt_feat && prompt_feat_len > 0) {
@@ -4427,7 +4427,7 @@ static void streamer_ensure_gen_noise(chatterbox_s3gen_streamer* st, int mel_fra
 
 static std::vector<float> streamer_join_crossfade(const std::vector<float>& left, const std::vector<float>& right,
                                                   int crossfade_samples) {
-    const int overlap = std::min(crossfade_samples, std::min((int)left.size(), (int)right.size()));
+    const int overlap = (std::min)(crossfade_samples, (std::min)((int)left.size(), (int)right.size()));
     if (overlap <= 0) {
         std::vector<float> out = left;
         out.insert(out.end(), right.begin(), right.end());
@@ -4438,7 +4438,7 @@ static std::vector<float> streamer_join_crossfade(const std::vector<float>& left
     if ((int)left.size() > overlap)
         out.insert(out.end(), left.begin(), left.end() - overlap);
     for (int i = 0; i < overlap; i++) {
-        const float fo = 1.0f - (float)i / (float)std::max(overlap - 1, 1);
+        const float fo = 1.0f - (float)i / (float)(std::max)(overlap - 1, 1);
         const float fi = 1.0f - fo;
         out.push_back(left[(size_t)left.size() - (size_t)overlap + (size_t)i] * fo + right[(size_t)i] * fi);
     }

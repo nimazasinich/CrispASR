@@ -229,6 +229,7 @@ int chatterbox_dump_t3_next_logits(struct chatterbox_context* ctx, const char* t
 // returned buffer for callers that want the full clip); caller frees with
 // chatterbox_pcm_free. Callback signature matches qwen3 streaming.
 typedef void (*chatterbox_pcm_chunk_callback)(const float* pcm, int n_samples, int is_final, void* user_data);
+typedef chatterbox_pcm_chunk_callback chatterbox_pcm_stream_callback;
 
 float* chatterbox_synthesize_streaming(struct chatterbox_context* ctx, const char* text, int chunk_tokens,
                                        chatterbox_pcm_chunk_callback cb, void* user_data, volatile int* cancel_flag,

@@ -11,21 +11,16 @@ permissions:
 
 jobs:
   build-windows-vulkan:
-    runs-on: windows-2022
-    env:
-      BASE_COMMIT: 3b93758f9725d400eca82976f895e4cec3f31260
+    runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           ref: ${{ github.ref }}
           submodules: recursive
-          fetch-depth: 0
 
       - name: Verify scheduler fix + full streamer sources
         shell: pwsh
         run: |
-          git cat-file -t $env:BASE_COMMIT
-          git merge-base --is-ancestor $env:BASE_COMMIT HEAD
           if (-not (Select-String -Path ggml\src\ggml-backend.cpp -Pattern "ggml_backend_sched_apply_src_mutations" -Quiet)) {
             throw "T3 scheduler rewire fix is missing"
           }
@@ -35,9 +30,8 @@ jobs:
           if (-not (Select-String -Path src\chatterbox_s3gen.h -Pattern "chatterbox_s3gen_streamer_create" -Quiet)) {
             throw "S3GenStreamer API missing"
           }
-          if (-not (Select-String -Path src\chatterbox.cpp -Pattern "chatterbox_synthesize_streaming" -Quiet)) {
-            throw "chatterbox_synthesize_streaming missing"
-          }
+          $n = (Select-String -Path src\chatterbox.cpp -Pattern "float\* chatterbox_synthesize_streaming" -AllMatches).Count
+          if ($n -ne 1) { throw "expected exactly one chatterbox_synthesize_streaming definition, found $n" }
           $be = Get-Content "examples/cli/crispasr_backend_chatterbox.cpp" -Raw
           if ($be -notmatch "CRISPASR_CHATTERBOX_STREAM" -or $be -notmatch "CAP_STREAMING") {
             throw "CAP_STREAMING opt-in missing from chatterbox backend"
@@ -64,7 +58,6 @@ jobs:
           call "%VSINSTALL%\VC\Auxiliary\Build\vcvars64.bat"
           cmake -S . -B build -G Ninja ^
             -DCMAKE_BUILD_TYPE=Release ^
-            -DBUILD_SHARED_LIBS=ON ^
             -DGGML_VULKAN=ON ^
             -DGGML_CUDA=OFF ^
             -DGGML_NATIVE=OFF ^
@@ -77,14 +70,8 @@ jobs:
         run: |
           $out = "release\crispasr-windows-x86_64-vulkan-s3stream"
           New-Item -ItemType Directory -Force $out | Out-Null
-          $bins = @("build\bin", "build\bin\Release") | Where-Object { Test-Path $_ }
-          if (-not $bins) { throw "no build bin directory" }
-          foreach ($d in $bins) {
-            Copy-Item "$d\crispasr.exe" $out -ErrorAction SilentlyContinue
-            Get-ChildItem "$d\*.dll" -ErrorAction SilentlyContinue |
-              Where-Object { $_.Name -notlike "Catch2*" } |
-              Copy-Item -Destination $out
-          }
+          Copy-Item build\bin\crispasr.exe $out\
+          Get-ChildItem build\bin\*.dll | Where-Object { $_.Name -notlike 'Catch2*' } | Copy-Item -Destination $out\
           if (-not (Test-Path "$out\crispasr.exe")) { throw "crispasr.exe missing" }
           if (-not (Test-Path "$out\ggml-vulkan.dll")) { throw "ggml-vulkan.dll missing" }
           Copy-Item vulkan-sdk-version.txt $out -ErrorAction SilentlyContinue
