@@ -11,6 +11,7 @@
 
 #include "chatterbox.h"
 
+#include <algorithm>
 #include <cctype>
 #include <cstdio>
 #include <cstdlib>
