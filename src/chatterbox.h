@@ -65,6 +65,15 @@ int chatterbox_set_s3gen_path(struct chatterbox_context* ctx, const char* path);
 // success. Returns nullptr on error.
 float* chatterbox_synthesize(struct chatterbox_context* ctx, const char* text, int* out_n_samples);
 
+// Experimental incremental Chatterbox synthesis. T3 is generated in full, then
+// S3Gen/HiFT is evaluated over growing speech-token prefixes and PCM is emitted
+// incrementally. The callback is invoked with mono 24 kHz float32 PCM; the last
+// callback has is_final=1. The returned buffer is the concatenated PCM and must
+// be freed with chatterbox_pcm_free(). This API is opt-in at the CLI backend.
+typedef void (*chatterbox_pcm_stream_callback)(const float* pcm, int n_samples, int is_final, void* user_data);
+float* chatterbox_synthesize_streaming(struct chatterbox_context* ctx, const char* text, int chunk_tokens,
+                                       chatterbox_pcm_stream_callback cb, void* user_data, int* out_n_samples);
+
 // Run T3 + S3Gen stages: text → mel spectrogram (80 channels).
 // Returns channel-first float array (80 * T_mel), caller frees with free().
 // *out_T_mel is set to the number of mel frames.
