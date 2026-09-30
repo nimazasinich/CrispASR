@@ -1,0 +1,99 @@
+name: T3 Vulkan multi-GPU build
+
+on:
+  push:
+    branches:
+      - t3-vulkan-multigpu
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-windows-vulkan-multigpu:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.ref }}
+          submodules: recursive
+
+      - name: Verify T3 scheduler and multi-GPU selectors
+        shell: pwsh
+        run: |
+          $sched = Get-Content "ggml/src/ggml-backend.cpp" -Raw
+          $t3 = Get-Content "src/chatterbox.cpp" -Raw
+          $s3 = Get-Content "src/chatterbox_s3gen.cpp" -Raw
+          $sel = Get-Content "src/chatterbox_gpu_select.h" -Raw
+          if ($sched -notmatch "copy_src" -or $sched -notmatch "ggml_backend_sched_apply_src_mutations") {
+            throw "T3 scheduler cached-rewire fix is missing"
+          }
+          if ($t3 -notmatch "CRISPASR_CHATTERBOX_T3_DEVICE") {
+            throw "T3 device selector is missing"
+          }
+          if ($s3 -notmatch "CRISPASR_CHATTERBOX_S3GEN_DEVICE") {
+            throw "S3Gen device selector is missing"
+          }
+          if ($sel -notmatch "ggml_backend_dev_init") {
+            throw "stage-local GPU selector helper is missing"
+          }
+
+      - name: Install Vulkan SDK
+        shell: pwsh
+        run: |
+          $ver = (Invoke-RestMethod -Uri "https://vulkan.lunarg.com/sdk/latest.json").windows
+          $url = "https://sdk.lunarg.com/sdk/download/$ver/windows/vulkan_sdk.exe"
+          Invoke-WebRequest -Uri $url -OutFile vulkan_sdk.exe
+          Start-Process -FilePath .\vulkan_sdk.exe -ArgumentList "--accept-licenses","--default-answer","--confirm-command","install" -Wait
+          $sdk = "C:\VulkanSDK\$ver"
+          "VULKAN_SDK=$sdk" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "$sdk\Bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+
+      - name: Build
+        shell: cmd
+        run: |
+          for /f "tokens=*" %%i in ('"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath') do set VSINSTALL=%%i
+          call "%VSINSTALL%\VC\Auxiliary\Build\vcvars64.bat"
+          cmake -S . -B build -G Ninja ^
+            -DCMAKE_BUILD_TYPE=Release ^
+            -DGGML_VULKAN=ON ^
+            -DGGML_CUDA=OFF ^
+            -DGGML_NATIVE=OFF ^
+            -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON ^
+            -DCRISPASR_BUILD_TESTS=OFF
+          cmake --build build --target crispasr-cli -j %NUMBER_OF_PROCESSORS%
+
+      - name: Package and hash
+        shell: pwsh
+        run: |
+          $out = "release\crispasr-windows-x86_64-vulkan-t3fix-multigpu"
+          New-Item -ItemType Directory -Force $out | Out-Null
+          Copy-Item build\bin\crispasr.exe $out\
+          Get-ChildItem build\bin\*.dll | Where-Object { $_.Name -notlike 'Catch2*' } | Copy-Item -Destination $out\
+          @"
+Multi-GPU Chatterbox selectors:
+  CRISPASR_CHATTERBOX_T3_DEVICE
+  CRISPASR_CHATTERBOX_S3GEN_DEVICE
+
+Selector forms:
+  0 / 1 / ...       GPU ordinal among registered GPU devices
+  Vulkan0           exact ggml device name
+  0000:03:00.0      exact PCI id
+  GTX 1070          unique description substring
+
+For dual-GPU Chatterbox also enable T3 GPU:
+  CRISPASR_CHATTERBOX_T3_GPU=1
+"@ | Set-Content "$out\MULTIGPU_README.txt"
+          Push-Location $out
+          Get-ChildItem -File | ForEach-Object {
+            $h = (Get-FileHash $_.FullName -Algorithm SHA256).Hash
+            "$h  $($_.Name)"
+          } | Set-Content SHA256SUMS.txt
+          Pop-Location
+          Compress-Archive -Path $out -DestinationPath release\crispasr-windows-x86_64-vulkan-t3fix-multigpu.zip -CompressionLevel Optimal
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: crispasr-windows-x86_64-vulkan-t3fix-multigpu
+          path: release/crispasr-windows-x86_64-vulkan-t3fix-multigpu.zip
+          if-no-files-found: error
