@@ -70,20 +70,21 @@ jobs:
           New-Item -ItemType Directory -Force $out | Out-Null
           Copy-Item build\bin\crispasr.exe $out\
           Get-ChildItem build\bin\*.dll | Where-Object { $_.Name -notlike 'Catch2*' } | Copy-Item -Destination $out\
-          @"
-Multi-GPU Chatterbox selectors:
-  CRISPASR_CHATTERBOX_T3_DEVICE
-  CRISPASR_CHATTERBOX_S3GEN_DEVICE
-
-Selector forms:
-  0 / 1 / ...       GPU ordinal among registered GPU devices
-  Vulkan0           exact ggml device name
-  0000:03:00.0      exact PCI id
-  GTX 1070          unique description substring
-
-For dual-GPU Chatterbox also enable T3 GPU:
-  CRISPASR_CHATTERBOX_T3_GPU=1
-"@ | Set-Content "$out\MULTIGPU_README.txt"
+          $readme = @(
+            "Multi-GPU Chatterbox selectors:",
+            "  CRISPASR_CHATTERBOX_T3_DEVICE",
+            "  CRISPASR_CHATTERBOX_S3GEN_DEVICE",
+            "",
+            "Selector forms:",
+            "  0 / 1 / ...       GPU ordinal among registered GPU devices",
+            "  Vulkan0           exact ggml device name",
+            "  0000:03:00.0      exact PCI id",
+            "  GTX 1070          unique description substring",
+            "",
+            "For dual-GPU Chatterbox also enable T3 GPU:",
+            "  CRISPASR_CHATTERBOX_T3_GPU=1"
+          )
+          $readme | Set-Content "$out\MULTIGPU_README.txt"
           Push-Location $out
           Get-ChildItem -File | ForEach-Object {
             $h = (Get-FileHash $_.FullName -Algorithm SHA256).Hash
