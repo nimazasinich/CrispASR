@@ -222,6 +222,18 @@ int chatterbox_dump_t3_next_logits(struct chatterbox_context* ctx, const char* t
                                    int n_prefix, float** out_logits_cond, float** out_logits_uncond,
                                    float** out_logits_blended, int* out_V);
 
+// Opt-in Phase-2 streaming: full T3 → windowed S3GenStreamer → PCM callbacks.
+// Does NOT alter chatterbox_synthesize(). chunk_tokens<=0 defaults to 24.
+// cancel_flag may be null; when non-null and set, streaming stops between windows.
+// Returns total PCM samples delivered via callback (also concatenated into the
+// returned buffer for callers that want the full clip); caller frees with
+// chatterbox_pcm_free. Callback signature matches qwen3 streaming.
+typedef void (*chatterbox_pcm_chunk_callback)(const float* pcm, int n_samples, int is_final, void* user_data);
+
+float* chatterbox_synthesize_streaming(struct chatterbox_context* ctx, const char* text, int chunk_tokens,
+                                       chatterbox_pcm_chunk_callback cb, void* user_data, volatile int* cancel_flag,
+                                       int* out_n_samples);
+
 #ifdef __cplusplus
 }
 #endif

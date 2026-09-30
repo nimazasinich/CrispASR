@@ -6601,6 +6601,22 @@ static void ggml_vk_host_get(const vk_device& device, const void * ptr, vk_buffe
     }
 }
 
+static bool ggml_backend_buffer_is_vk(ggml_backend_buffer_t buffer);
+
+// Diagnostic only. A CPU (or other foreign) buffer context is not a
+// ggml_backend_vk_buffer_context; casting it and copying the embedded
+// shared_ptr reads activation bytes as a control block. The scheduler
+// is supposed to have copied the tensor onto a Vulkan buffer first.
+static void ggml_vk_abort_if_not_vk_buffer(const ggml_tensor * tensor) {
+    if (tensor->buffer != nullptr && ggml_backend_buffer_is_vk(tensor->buffer)) {
+        return;
+    }
+    GGML_ABORT("ggml_vulkan: tensor '%s' (op %s) buffer '%s' is not a Vulkan buffer; refusing to interpret its context as a device buffer\n",
+        tensor->name,
+        ggml_op_name(tensor->op),
+        tensor->buffer != nullptr ? ggml_backend_buffer_name(tensor->buffer) : "null");
+}
+
 static vk_subbuffer ggml_vk_tensor_subbuffer(
     const ggml_backend_vk_context * ctx, const ggml_tensor * tensor, bool allow_misalign = false) {
 
@@ -6610,6 +6626,7 @@ static vk_subbuffer ggml_vk_tensor_subbuffer(
         ggml_vk_host_get(ctx->device, tensor->data, buffer, offset);
     }
     if (!buffer) {
+        ggml_vk_abort_if_not_vk_buffer(tensor);
         auto buf_ctx = (ggml_backend_vk_buffer_context *)tensor->buffer->context;
         buffer = buf_ctx->dev_buffer;
         offset = vk_tensor_offset(tensor) + tensor->view_offs;
@@ -11256,7 +11273,6 @@ static void ggml_vk_rms_norm(ggml_backend_vk_context * ctx, vk_context& subctx, 
                 offset[i] = 0;
                 continue;
             }
-            buf_ctx[i] = (ggml_backend_vk_buffer_context *)tensors[i]->buffer->context;
             buf[i] = nullptr;
             offset[i] = 0;
             uma[i] = false;
@@ -11266,6 +11282,8 @@ static void ggml_vk_rms_norm(ggml_backend_vk_context * ctx, vk_context& subctx, 
                 uma[i] = buf[i] != nullptr;
             }
             if (!uma[i]) {
+                ggml_vk_abort_if_not_vk_buffer(tensors[i]);
+                buf_ctx[i] = (ggml_backend_vk_buffer_context *)tensors[i]->buffer->context;
                 buf[i] = buf_ctx[i]->dev_buffer;
                 offset[i] = vk_tensor_offset(tensors[i]) + tensors[i]->view_offs;
             }

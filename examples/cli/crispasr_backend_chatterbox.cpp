@@ -111,7 +111,14 @@ public:
     const char* name() const override { return "chatterbox"; }
 
     uint32_t capabilities() const override {
-        return CAP_TTS | CAP_AUTO_DOWNLOAD | CAP_TEMPERATURE | CAP_FLASH_ATTN | CAP_VOICE_CLONING;
+        uint32_t caps = CAP_TTS | CAP_AUTO_DOWNLOAD | CAP_TEMPERATURE | CAP_FLASH_ATTN | CAP_VOICE_CLONING;
+        // Opt-in only: CRISPASR_CHATTERBOX_STREAM=1 advertises CAP_STREAMING so the
+        // server uses synthesize_streaming(). Sync synthesize() remains the default
+        // when the env is unset / "0".
+        const char* stream_env = std::getenv("CRISPASR_CHATTERBOX_STREAM");
+        if (stream_env && stream_env[0] && stream_env[0] != '0')
+            caps |= CAP_STREAMING;
+        return caps;
     }
 
     std::vector<crispasr_segment> transcribe(const float* /*samples*/, int /*n_samples*/, int64_t /*t_offset_cs*/,
@@ -201,6 +208,57 @@ public:
         std::vector<float> out(pcm, pcm + n);
         chatterbox_pcm_free(pcm);
         return out;
+    }
+
+    void synthesize_streaming(const std::string& text, const whisper_params& params,
+                              crispasr_pcm_stream_callback cb) override {
+        if (!ctx_ || text.empty())
+            return;
+        if (!s3gen_loaded_) {
+            fprintf(stderr, "crispasr[chatterbox]: S3Gen not loaded. Pass --codec-model <s3gen.gguf>\n");
+            return;
+        }
+        // Mirror synthesize() voice / sampling setup so stream and sync share knobs.
+        if (!params.tts_voice.empty() && params.tts_voice != last_voice_key_) {
+            if (chatterbox_set_voice_from_wav(ctx_, params.tts_voice.c_str()) == 0) {
+                last_voice_key_ = params.tts_voice;
+            } else {
+                return;
+            }
+        }
+        chatterbox_set_seed(ctx_, (uint32_t)params.seed);
+        if (!params.language.empty() && params.language != "auto")
+            chatterbox_set_language(ctx_, params.language.c_str());
+        else
+            chatterbox_set_language(ctx_, nullptr);
+        if (params.tts_top_p >= 0.0f)
+            chatterbox_set_top_p(ctx_, params.tts_top_p);
+        if (params.tts_min_p >= 0.0f)
+            chatterbox_set_min_p(ctx_, params.tts_min_p);
+        if (params.tts_top_k >= 0)
+            chatterbox_set_top_k(ctx_, params.tts_top_k);
+        if (params.tts_repetition_penalty >= 0.0f)
+            chatterbox_set_repetition_penalty(ctx_, params.tts_repetition_penalty);
+        if (params.tts_cfg_scale >= 0.0f)
+            chatterbox_set_cfg_weight(ctx_, params.tts_cfg_scale);
+        if (params.tts_num_steps >= 0)
+            chatterbox_set_cfm_steps(ctx_, params.tts_num_steps);
+        if (params.tts_exaggeration >= 0.0f)
+            chatterbox_set_exaggeration(ctx_, params.tts_exaggeration);
+        if (params.tts_max_speech_tokens >= 0)
+            chatterbox_set_max_speech_tokens(ctx_, params.tts_max_speech_tokens);
+        if (params.temperature > 0.0f)
+            chatterbox_set_temperature(ctx_, params.temperature);
+
+        auto trampoline = [](const float* pcm, int n_samples, int is_final, void* user_data) {
+            auto* fn = static_cast<crispasr_pcm_stream_callback*>(user_data);
+            if (n_samples > 0 || is_final)
+                (*fn)(pcm, n_samples, is_final != 0);
+        };
+        int n = 0;
+        // chunk_tokens=24 matches upstream Turbo stream() default.
+        float* full = chatterbox_synthesize_streaming(ctx_, text.c_str(), 24, trampoline, &cb, nullptr, &n);
+        chatterbox_pcm_free(full);
     }
 
     void shutdown() override {

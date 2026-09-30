@@ -3808,6 +3808,120 @@ extern "C" float* chatterbox_synthesize(struct chatterbox_context* ctx, const ch
     return pcm;
 }
 
+extern "C" float* chatterbox_synthesize_streaming(struct chatterbox_context* ctx, const char* text, int chunk_tokens,
+                                                  chatterbox_pcm_chunk_callback cb, void* user_data,
+                                                  volatile int* cancel_flag, int* out_n_samples) {
+    if (!ctx || !text || !out_n_samples)
+        return nullptr;
+    *out_n_samples = 0;
+    if (!ctx->s3gen_ctx) {
+        fprintf(stderr, "chatterbox: S3Gen not loaded. Call chatterbox_set_s3gen_path first.\n");
+        return nullptr;
+    }
+    if (chunk_tokens <= 0)
+        chunk_tokens = 24;
+
+    int n_tokens = 0;
+    int32_t* speech_tokens = chatterbox_synthesize_tokens(ctx, text, &n_tokens);
+    if (!speech_tokens || n_tokens <= 0) {
+        if (speech_tokens)
+            chatterbox_tokens_free(speech_tokens);
+        return nullptr;
+    }
+    if (cancel_flag && *cancel_flag) {
+        chatterbox_tokens_free(speech_tokens);
+        return nullptr;
+    }
+
+    // Strip trailing S3GEN_SIL that turbo/gpt2 token path already appended so
+    // streamer.finish() can re-append them once (upstream contract).
+    constexpr int32_t S3GEN_SIL = 4299;
+    while (n_tokens > 0 && speech_tokens[n_tokens - 1] == S3GEN_SIL)
+        --n_tokens;
+    if (n_tokens <= 0) {
+        chatterbox_tokens_free(speech_tokens);
+        return nullptr;
+    }
+
+    std::vector<int32_t> pt_buf;
+    std::vector<float> pf_buf, se_buf;
+    const int32_t* prompt_tokens = nullptr;
+    int n_prompt = 0;
+    const float* prompt_feat = nullptr;
+    int prompt_feat_len = 0;
+    const float* spk_emb = nullptr;
+    if (ctx->conds.gen_prompt_token) {
+        n_prompt = (int)ctx->conds.gen_prompt_token->ne[0];
+        pt_buf.resize(n_prompt);
+        ggml_backend_tensor_get(ctx->conds.gen_prompt_token, pt_buf.data(), 0, n_prompt * sizeof(int32_t));
+        prompt_tokens = pt_buf.data();
+    }
+    if (ctx->conds.gen_prompt_feat) {
+        prompt_feat_len = (int)ctx->conds.gen_prompt_feat->ne[1];
+        pf_buf.resize((size_t)prompt_feat_len * 80);
+        ggml_backend_tensor_get(ctx->conds.gen_prompt_feat, pf_buf.data(), 0, pf_buf.size() * sizeof(float));
+        prompt_feat = pf_buf.data();
+    }
+    if (ctx->conds.gen_embedding) {
+        se_buf.resize(192);
+        ggml_backend_tensor_get(ctx->conds.gen_embedding, se_buf.data(), 0, 192 * sizeof(float));
+        spk_emb = se_buf.data();
+    }
+
+    chatterbox_s3gen_streamer* st = chatterbox_s3gen_streamer_create(
+        ctx->s3gen_ctx, prompt_tokens, n_prompt, prompt_feat, prompt_feat_len, spk_emb, ctx->params.cfm_steps, 12.0f);
+    if (!st) {
+        chatterbox_tokens_free(speech_tokens);
+        return nullptr;
+    }
+    chatterbox_s3gen_streamer_set_cancel_flag(st, cancel_flag);
+
+    std::vector<float> all_pcm;
+    auto emit = [&](float* pcm, int n, int is_final) {
+        if (pcm && n > 0) {
+            all_pcm.insert(all_pcm.end(), pcm, pcm + n);
+            if (cb)
+                cb(pcm, n, is_final, user_data);
+        } else if (is_final && cb) {
+            cb(nullptr, 0, 1, user_data);
+        }
+        if (pcm)
+            chatterbox_s3gen_pcm_free(pcm);
+    };
+
+    for (int i = 0; i < n_tokens; ++i) {
+        if (cancel_flag && *cancel_flag)
+            break;
+        if (chatterbox_s3gen_streamer_append(st, &speech_tokens[i], 1) != 0)
+            break;
+        if ((i + 1) % chunk_tokens == 0) {
+            int n = 0;
+            float* pcm = chatterbox_s3gen_streamer_flush(st, /*finalize=*/0, &n);
+            emit(pcm, n, 0);
+        }
+    }
+
+    if (!(cancel_flag && *cancel_flag)) {
+        int n = 0;
+        float* pcm = chatterbox_s3gen_streamer_finish(st, &n);
+        emit(pcm, n, 1);
+    } else if (cb) {
+        cb(nullptr, 0, 1, user_data);
+    }
+
+    chatterbox_s3gen_streamer_free(st);
+    chatterbox_tokens_free(speech_tokens);
+
+    if (all_pcm.empty())
+        return nullptr;
+    float* out = (float*)malloc(all_pcm.size() * sizeof(float));
+    if (!out)
+        return nullptr;
+    std::memcpy(out, all_pcm.data(), all_pcm.size() * sizeof(float));
+    *out_n_samples = (int)all_pcm.size();
+    return out;
+}
+
 extern "C" float* chatterbox_synthesize_from_tokens(struct chatterbox_context* ctx, const int32_t* speech_tokens,
                                                     int n_speech_tokens, int* out_n_samples) {
     if (!ctx || !speech_tokens || n_speech_tokens <= 0 || !out_n_samples)
