@@ -16,6 +16,7 @@
 #include "chatterbox_s3gen.h"
 #include "chatterbox_ve.h"
 #include "chatterbox_text_prep.h"
+#include "chatterbox_gpu_select.h"
 #include "core/attention.h"
 #include "core/audio_resample.h"
 #include "core/bpe.h"
@@ -3157,8 +3158,18 @@ extern "C" struct chatterbox_context* chatterbox_init_from_file(const char* path
     // via chatterbox_set_s3gen_path). c->backend is the T3 backend.
     c->params.use_gpu = s3gen_use_gpu;
     bool effective_use_gpu = t3_use_gpu;
-    c->backend = effective_use_gpu ? ggml_backend_init_best() : c->backend_cpu;
+    const char* t3_device_selector = std::getenv("CRISPASR_CHATTERBOX_T3_DEVICE");
+    c->backend = effective_use_gpu
+        ? crispasr_init_selected_gpu(t3_device_selector, params.verbosity, "chatterbox:T3")
+        : c->backend_cpu;
     if (!c->backend) {
+        if (effective_use_gpu && t3_device_selector && *t3_device_selector) {
+            fprintf(stderr,
+                    "chatterbox: requested T3 GPU '%s' is unavailable; refusing silent fallback to a different device\n",
+                    t3_device_selector);
+            delete c;
+            return nullptr;
+        }
         if (params.verbosity >= 1 && effective_use_gpu) {
             fprintf(stderr, "chatterbox: GPU backend unavailable, falling back to CPU\n");
         }
