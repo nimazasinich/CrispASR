@@ -226,7 +226,11 @@ static inline void shaw_block_attention_cpu(float* out, const float* Q_data, con
     const int d = n_heads * hd;
     const int n_blocks = (T + ctx_size - 1) / ctx_size;
 
+#if defined(_MSC_VER)
+#pragma omp parallel for schedule(static)
+#else
 #pragma omp parallel for collapse(2) schedule(static)
+#endif
     for (int blk = 0; blk < n_blocks; blk++) {
         for (int h = 0; h < n_heads; h++) {
             const int blk_start = blk * ctx_size;
