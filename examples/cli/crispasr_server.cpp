@@ -1785,12 +1785,58 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
             });
             worker.detach();
 
-            res.set_chunked_content_provider("audio/pcm", [sq](size_t /*offset*/, httplib::DataSink& sink) -> bool {
+            // Capture the httplib connection probe while the response provider is active.
+            // Without this, disconnects before first PCM are invisible until the first
+            // sink.write(), so T3 can waste a full utterance after the client is gone.
+            const auto connection_closed = req.is_connection_closed;
+            res.set_chunked_content_provider("audio/pcm", [sq, connection_closed](size_t /*offset*/, httplib::DataSink& sink) -> bool {
+                auto mark_cancelled = [&]() {
+                    {
+                        std::lock_guard<std::mutex> lk(sq->m);
+                        sq->cancelled = true;
+                    }
+                    sq->cv.notify_all();
+                };
+
                 std::unique_lock<std::mutex> lk(sq->m);
-                sq->cv.wait(lk, [&] { return !sq->q.empty() || sq->done || sq->cancelled; });
-                if (sq->q.empty() && (sq->done || sq->cancelled)) {
+                while (sq->q.empty() && !sq->done && !sq->cancelled) {
+                    sq->cv.wait_for(lk, std::chrono::milliseconds(50));
+                    if (!sq->q.empty() || sq->done || sq->cancelled)
+                        break;
+
+                    // Poll the underlying socket even before the first PCM chunk exists.
+                    // This function is provided by httplib for the lifetime of the active
+                    // response and does not submit or synchronize GPU work.
                     lk.unlock();
-                    sink.done();
+                    const bool closed = connection_closed && connection_closed();
+                    lk.lock();
+                    if (closed) {
+                        sq->cancelled = true;
+                        lk.unlock();
+                        sq->cv.notify_all();
+                        return false;
+                    }
+                }
+
+                if (sq->q.empty() && (sq->done || sq->cancelled)) {
+                    const bool was_cancelled = sq->cancelled;
+                    lk.unlock();
+                    if (!was_cancelled)
+                        sink.done();
+                    return !was_cancelled;
+                }
+
+                // Avoid emitting a stale chunk if the peer disconnected while the
+                // worker was producing it.
+                lk.unlock();
+                if (connection_closed && connection_closed()) {
+                    mark_cancelled();
+                    return false;
+                }
+                lk.lock();
+
+                if (sq->q.empty()) {
+                    lk.unlock();
                     return true;
                 }
                 std::string c = std::move(sq->q.front());
@@ -1798,10 +1844,7 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
                 lk.unlock();
                 sq->cv.notify_one(); // release the worker's backpressure wait
                 if (!sink.write(c.data(), c.size())) {
-                    // Client disconnected — tell the worker to stop producing.
-                    std::lock_guard<std::mutex> lk2(sq->m);
-                    sq->cancelled = true;
-                    sq->cv.notify_all();
+                    mark_cancelled();
                     return false;
                 }
                 return true;
