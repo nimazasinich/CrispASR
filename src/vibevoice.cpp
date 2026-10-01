@@ -11,7 +11,9 @@
 // #include <math.h> in vibevoice.h or the ggml headers commits the
 // macro state — defining it later is a no-op). Linux/macOS get M_PI
 // via libc compat; Windows CI fails with C2065 without this.
+#ifndef _USE_MATH_DEFINES
 #define _USE_MATH_DEFINES
+#endif
 
 #include "vibevoice.h"
 #include "core/attention.h"
