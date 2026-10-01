@@ -2253,6 +2253,8 @@ void tada_set_noise_temp(struct tada_context* ctx, float temp) {
         ctx->params.noise_temp = temp;
 }
 
+} // extern "C"
+
 static std::string tada_normalize_text(std::string text) {
     auto replace_all = [](std::string& s, const std::string& from, const std::string& to) {
         if (from.empty())
@@ -2337,6 +2339,8 @@ static void tada_build_input_ids_for_text(tada_context* ctx, const char* text, s
     if (text_ids_out)
         *text_ids_out = std::move(text_ids);
 }
+
+extern "C" {
 
 float* tada_extract_stage(struct tada_context* ctx, const char* text, const char* stage, int* out_n) {
     if (out_n)
