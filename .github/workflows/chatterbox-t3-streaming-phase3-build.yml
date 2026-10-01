@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - chatterbox-t3-streaming-phase3
+      - chatterbox-stream-cancel-fix
   workflow_dispatch:
 
 permissions:
@@ -35,6 +36,7 @@ jobs:
           $be = Get-Content examples\cli\crispasr_backend_chatterbox.cpp -Raw
           if ($cpp -notmatch "chatterbox_synthesize_t3_streaming") { throw "T3 streaming implementation missing" }
           if ($hdr -notmatch "chatterbox_synthesize_token_chunks") { throw "T3 token chunk API missing" }
+          if ($hdr -notmatch "chatterbox_synthesize_streaming_cancelable") { throw "callback-aware streaming cancel API missing" }
           if ($be -notmatch "CRISPASR_CHATTERBOX_T3_STREAM") { throw "T3 streaming feature gate missing" }
           if ($be -notmatch "CRISPASR_CHATTERBOX_STREAM") { throw "S3Gen streaming feature gate missing" }
           $n = (Select-String -Path src\chatterbox.cpp -Pattern 'float\* chatterbox_synthesize_t3_streaming' -AllMatches).Count
