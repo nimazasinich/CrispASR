@@ -26,7 +26,9 @@
 // _USE_MATH_DEFINES is set BEFORE the include. Defining it here keeps
 // the Windows whisper.dll build working — Unix toolchains expose M_PI
 // unconditionally so the define is a no-op there.
+#ifndef _USE_MATH_DEFINES
 #define _USE_MATH_DEFINES
+#endif
 
 #include "cosyvoice3_tts.h"
 
