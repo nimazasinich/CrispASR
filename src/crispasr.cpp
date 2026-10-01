@@ -19,7 +19,9 @@
 #include <algorithm>
 #include <cassert>
 #include <cfloat>
+#ifndef _USE_MATH_DEFINES
 #define _USE_MATH_DEFINES
+#endif
 #include <cmath>
 #include <climits>
 #include <cstdarg>
@@ -1712,7 +1714,7 @@ static bool aheads_masks_init(const whisper_context_params& cparams, const whisp
             size_t data_size_bytes = data_size * sizeof(float);
             mask_data.resize(data_size);
 
-            std::fill(mask_data.begin(), mask_data.end(), 0);
+            std::fill(mask_data.begin(), mask_data.end(), 0.0f);
             for (size_t ih = 0; ih < aheads.size(); ++ih) {
                 size_t pos = (aheads[ih] + (ih * aheads_masks.m[il]->ne[0]));
                 mask_data[pos] = 1.0f;
@@ -3531,7 +3533,7 @@ static void log_mel_spectrogram_worker_thread(int ith, const float* hann, const 
 
         // fill the rest with zeros
         if (n_samples - offset < frame_size) {
-            std::fill(fft_in.begin() + (n_samples - offset), fft_in.end(), 0.0);
+            std::fill(fft_in.begin() + (n_samples - offset), fft_in.end(), 0.0f);
         }
 
         // FFT
@@ -3594,7 +3596,7 @@ static bool log_mel_spectrogram(whisper_state& wstate, const float* samples, con
 
     // pad 30 seconds of zeros at the end of audio (480,000 samples) + reflective pad 200 samples at the end of audio
     std::fill(samples_padded.begin() + n_samples + stage_2_pad,
-              samples_padded.begin() + n_samples + stage_1_pad + 2 * stage_2_pad, 0);
+              samples_padded.begin() + n_samples + stage_1_pad + 2 * stage_2_pad, 0.0f);
 
     // reflective pad 200 samples at the beginning of audio
     std::reverse_copy(samples + 1, samples + 1 + stage_2_pad, samples_padded.begin());
@@ -3607,16 +3609,20 @@ static bool log_mel_spectrogram(whisper_state& wstate, const float* samples, con
     mel.n_len_org = 1 + (n_samples + stage_2_pad - frame_size) / frame_step;
     mel.data.resize(mel.n_mel * mel.n_len);
 
+    CRISPASR_ASSERT(n_samples >= 0);
+    CRISPASR_ASSERT(stage_2_pad >= 0 && stage_2_pad <= INT_MAX - n_samples);
+    const int padded_n_samples = n_samples + static_cast<int>(stage_2_pad);
+
     {
         std::vector<std::thread> workers(n_threads - 1);
         for (int iw = 0; iw < n_threads - 1; ++iw) {
             workers[iw] = std::thread(log_mel_spectrogram_worker_thread, iw + 1, hann, std::cref(samples_padded),
-                                      n_samples + stage_2_pad, frame_size, frame_step, n_threads, std::cref(filters),
+                                      padded_n_samples, frame_size, frame_step, n_threads, std::cref(filters),
                                       std::ref(mel));
         }
 
         // main thread
-        log_mel_spectrogram_worker_thread(0, hann, samples_padded, n_samples + stage_2_pad, frame_size, frame_step,
+        log_mel_spectrogram_worker_thread(0, hann, samples_padded, padded_n_samples, frame_size, frame_step,
                                           n_threads, filters, mel);
 
         for (int iw = 0; iw < n_threads - 1; ++iw) {
