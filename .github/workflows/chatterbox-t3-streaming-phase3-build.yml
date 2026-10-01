@@ -6,6 +6,7 @@ on:
       - chatterbox-t3-streaming-phase3
       - chatterbox-stream-cancel-fix
       - chatterbox-stream-worker-lifetime
+      - chatterbox-stream-cancel-acceptance
   workflow_dispatch:
 
 permissions:
@@ -43,6 +44,9 @@ jobs:
           $server = Get-Content examples\cli\crispasr_server.cpp -Raw
           if ($server -match "worker\.detach\(\)") { throw "detached streaming worker still present" }
           if ($server -notmatch "worker->joinable\(\)") { throw "streaming worker join guard missing" }
+          $s3 = Get-Content src\chatterbox_s3gen.cpp -Raw
+          if ($s3 -notmatch "S3Gen observed cancellation before CFM step") { throw "S3Gen CFM cancellation checkpoint missing" }
+          if ($s3 -notmatch "S3Gen discarded completed HiFT graph after cancellation") { throw "S3Gen HiFT post-graph cancellation checkpoint missing" }
           $n = (Select-String -Path src\chatterbox.cpp -Pattern 'float\* chatterbox_synthesize_t3_streaming' -AllMatches).Count
           if ($n -ne 1) { throw "expected exactly one chatterbox_synthesize_t3_streaming definition, found $n" }
           Write-Host "HEAD $(git rev-parse HEAD)"
