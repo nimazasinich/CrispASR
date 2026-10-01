@@ -408,7 +408,11 @@ static void grouped_conv1d_same(const float* x, const float* w, const float* b, 
     for (int c = 0; c < C_in; c++)
         std::memcpy(padded.data() + c * L_pad + pad_l, x + c * L, L * sizeof(float));
 
+#if defined(_MSC_VER)
+#pragma omp parallel for schedule(static)
+#else
 #pragma omp parallel for schedule(static) collapse(2)
+#endif
     for (int g = 0; g < groups; g++) {
         for (int oc = 0; oc < cout_pg; oc++) {
             int ic0 = g * cin_pg, oc0 = g * cout_pg;
