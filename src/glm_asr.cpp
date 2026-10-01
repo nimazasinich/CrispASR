@@ -8,7 +8,9 @@
 
 #include "glm_asr.h"
 
+#ifndef _USE_MATH_DEFINES
 #define _USE_MATH_DEFINES
+#endif
 #include <cmath>
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
