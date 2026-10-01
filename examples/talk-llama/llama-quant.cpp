@@ -261,7 +261,7 @@ static void llama_tensor_dequantize_impl(ggml_tensor* tensor, std::vector<no_ini
         size_t thr_elems = thr_blocks * block_size;             // number of elements for this thread
         size_t thr_block_bytes = thr_blocks * block_size_bytes; // number of input bytes for this thread
 
-        auto compute = [qtype](ggml_type typ, uint8_t* inbuf, float* outbuf, int nels) {
+        auto compute = [qtype](ggml_type typ, uint8_t* inbuf, float* outbuf, int64_t nels) {
             if (typ == GGML_TYPE_F16) {
                 ggml_fp16_to_fp32_row((ggml_fp16_t*)inbuf, outbuf, nels);
             } else if (typ == GGML_TYPE_BF16) {
@@ -270,8 +270,9 @@ static void llama_tensor_dequantize_impl(ggml_tensor* tensor, std::vector<no_ini
                 qtype->to_float(inbuf, outbuf, nels);
             }
         };
+        GGML_ASSERT(thr_elems <= (size_t)INT64_MAX);
         workers.emplace_back(compute, tensor->type, (uint8_t*)tensor->data + in_buff_offs, f32_output + out_buff_offs,
-                             thr_elems);
+                             static_cast<int64_t>(thr_elems));
         in_buff_offs += thr_block_bytes;
         out_buff_offs += thr_elems;
     }
