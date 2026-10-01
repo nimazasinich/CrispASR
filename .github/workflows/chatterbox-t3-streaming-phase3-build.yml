@@ -102,63 +102,7 @@ jobs:
         run: |
           $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
           $vsinstall = & $vswhere -latest -property installationPath
-          cmd /c "call `"$vsinstall\VC\Auxiliary\Build\vcvars64.bat`" && set" | ForEach-Object {
-            if ($_ -match '^([^=]+)=(.*)
-      - name: Reject configure and MSVC warnings
-        shell: pwsh
-        run: |
-          $compilerLogs = @('test-build.log','cli-build.log')
-          $compilerHits = foreach ($log in $compilerLogs) {
-            if (Test-Path $log) {
-              Select-String -Path $log -Pattern 'warning [A-Z]+[0-9]{4}'
-            }
-          }
-          $cmakeHits = @()
-          if (Test-Path 'configure.log') {
-            $cmakeHits = Select-String -Path 'configure.log' -Pattern '^CMake (Deprecation )?Warning'
-          }
-          $hits = @($compilerHits) + @($cmakeHits)
-          if ($hits.Count -gt 0) {
-            $hits | ForEach-Object { Write-Host $_.Line }
-            throw "Windows warning-rootfix gate failed"
-          }
-          Write-Host "Warning-rootfix gate PASS: zero MSVC and CMake warnings"
-
-      - name: Package and hash
-        shell: pwsh
-        run: |
-          $out = "release\crispasr-windows-x86_64-vulkan-t3stream-phase3"
-          New-Item -ItemType Directory -Force $out | Out-Null
-          Copy-Item build\bin\crispasr.exe $out\
-          Get-ChildItem build\bin\*.dll | Where-Object { $_.Name -notlike 'Catch2*' } | Copy-Item -Destination $out\
-          if (-not (Test-Path "$out\crispasr.exe")) { throw "crispasr.exe missing" }
-          if (-not (Test-Path "$out\ggml-vulkan.dll")) { throw "ggml-vulkan.dll missing" }
-          Copy-Item vulkan-sdk-version.txt $out -ErrorAction SilentlyContinue
-          git rev-parse HEAD | Set-Content "$out\git-head.txt"
-          Set-Content -Path "$out\T3_STREAMING.txt" -Value @(
-            "S3Gen streaming: CRISPASR_CHATTERBOX_STREAM=1",
-            "T3 token/KV streaming: CRISPASR_CHATTERBOX_T3_STREAM=1",
-            "T3 GPU: CRISPASR_CHATTERBOX_T3_GPU=1",
-            "experimental Phase 3; default OFF"
-          )
-          $lines = foreach ($f in Get-ChildItem $out -File) {
-            $h = Get-FileHash $f.FullName -Algorithm SHA256
-            "{0}  {1}" -f $h.Hash, $f.Name
-          }
-          $lines | Set-Content "$out\SHA256SUMS.txt"
-          Get-Content "$out\SHA256SUMS.txt"
-          Compress-Archive -Path $out -DestinationPath release\crispasr-windows-x86_64-vulkan-t3stream-phase3.zip -CompressionLevel Optimal
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: crispasr-windows-x86_64-vulkan-t3stream-phase3-warning-rootfix
-          path: release/crispasr-windows-x86_64-vulkan-t3stream-phase3.zip
-          if-no-files-found: error
-) {
-              [System.Environment]::SetEnvironmentVariable($matches[1], $matches[2], 'Process')
-            }
-          }
-          cmake --build build --target crispasr-cli -j $env:NUMBER_OF_PROCESSORS 2>&1 | Tee-Object -FilePath cli-build.log
+          cmd /c "call `"$vsinstall\VC\Auxiliary\Build\vcvars64.bat`" && cmake --build build --target crispasr-cli -j %NUMBER_OF_PROCESSORS%" 2>&1 | Tee-Object -FilePath cli-build.log
           $buildRc = $LASTEXITCODE
           if ($buildRc -ne 0) { exit $buildRc }
 
