@@ -245,6 +245,13 @@ float* chatterbox_synthesize_streaming(struct chatterbox_context* ctx, const cha
                                        chatterbox_pcm_chunk_callback cb, void* user_data, volatile int* cancel_flag,
                                        int* out_n_samples);
 
+// Callback-aware variant used by HTTP streaming so disconnect cancellation can
+// interrupt full-T3 generation at the next safe token boundary.
+float* chatterbox_synthesize_streaming_cancelable(struct chatterbox_context* ctx, const char* text, int chunk_tokens,
+                                                  chatterbox_pcm_chunk_callback cb, void* user_data,
+                                                  chatterbox_cancel_callback cancel_cb, void* cancel_user_data,
+                                                  int* out_n_samples);
+
 // Experimental opt-in path: incremental T3/KV decode into the existing S3Gen streamer.
 // The callback returns nonzero to continue. Cancel query returns nonzero to stop.
 float* chatterbox_synthesize_t3_streaming(struct chatterbox_context* ctx, const char* text, int chunk_tokens,
