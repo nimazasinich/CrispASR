@@ -3473,6 +3473,8 @@ static int32_t* synthesize_tokens_impl(struct chatterbox_context* ctx, const cha
     int64_t t_dec0 = ggml_time_us();
     for (int step = 0; step < max_speech; step++) {
         if (cancel_cb && cancel_cb(cancel_data)) {
+            if (ctx->params.verbosity >= 1)
+                fprintf(stderr, "[CHATTERBOX_CANCEL] T3 observed cancellation at decode step %d\n", step);
             cancelled = true;
             break;
         }
@@ -3862,9 +3864,11 @@ extern "C" float* chatterbox_synthesize(struct chatterbox_context* ctx, const ch
     return pcm;
 }
 
-extern "C" float* chatterbox_synthesize_streaming(struct chatterbox_context* ctx, const char* text, int chunk_tokens,
-                                                  chatterbox_pcm_chunk_callback cb, void* user_data,
-                                                  volatile int* cancel_flag, int* out_n_samples) {
+static float* chatterbox_synthesize_streaming_impl(struct chatterbox_context* ctx, const char* text, int chunk_tokens,
+                                                   chatterbox_pcm_chunk_callback cb, void* user_data,
+                                                   volatile int* cancel_flag,
+                                                   chatterbox_cancel_callback cancel_cb, void* cancel_user_data,
+                                                   int* out_n_samples) {
     if (!ctx || !text || !out_n_samples)
         return nullptr;
     *out_n_samples = 0;
@@ -3875,14 +3879,20 @@ extern "C" float* chatterbox_synthesize_streaming(struct chatterbox_context* ctx
     if (chunk_tokens <= 0)
         chunk_tokens = 24;
 
+    auto is_cancelled = [&]() {
+        return (cancel_flag && *cancel_flag) || (cancel_cb && cancel_cb(cancel_user_data));
+    };
+
     int n_tokens = 0;
-    int32_t* speech_tokens = chatterbox_synthesize_tokens(ctx, text, &n_tokens);
+    int complete = 0;
+    int32_t* speech_tokens = synthesize_tokens_impl(ctx, text, &n_tokens, 0, nullptr, nullptr,
+                                                     cancel_cb, cancel_user_data, &complete);
     if (!speech_tokens || n_tokens <= 0) {
         if (speech_tokens)
             chatterbox_tokens_free(speech_tokens);
         return nullptr;
     }
-    if (cancel_flag && *cancel_flag) {
+    if (is_cancelled()) {
         chatterbox_tokens_free(speech_tokens);
         return nullptr;
     }
@@ -3929,6 +3939,7 @@ extern "C" float* chatterbox_synthesize_streaming(struct chatterbox_context* ctx
         return nullptr;
     }
     chatterbox_s3gen_streamer_set_cancel_flag(st, cancel_flag);
+    chatterbox_s3gen_streamer_set_cancel_callback(st, cancel_cb, cancel_user_data);
 
     std::vector<float> all_pcm;
     auto emit = [&](float* pcm, int n, int is_final) {
@@ -3944,7 +3955,7 @@ extern "C" float* chatterbox_synthesize_streaming(struct chatterbox_context* ctx
     };
 
     for (int i = 0; i < n_tokens; ++i) {
-        if (cancel_flag && *cancel_flag)
+        if (is_cancelled())
             break;
         if (chatterbox_s3gen_streamer_append(st, &speech_tokens[i], 1) != 0)
             break;
@@ -3955,7 +3966,7 @@ extern "C" float* chatterbox_synthesize_streaming(struct chatterbox_context* ctx
         }
     }
 
-    if (!(cancel_flag && *cancel_flag)) {
+    if (!is_cancelled()) {
         int n = 0;
         float* pcm = chatterbox_s3gen_streamer_finish(st, &n);
         emit(pcm, n, 1);
@@ -3974,6 +3985,21 @@ extern "C" float* chatterbox_synthesize_streaming(struct chatterbox_context* ctx
     std::memcpy(out, all_pcm.data(), all_pcm.size() * sizeof(float));
     *out_n_samples = (int)all_pcm.size();
     return out;
+}
+
+extern "C" float* chatterbox_synthesize_streaming(struct chatterbox_context* ctx, const char* text, int chunk_tokens,
+                                                  chatterbox_pcm_chunk_callback cb, void* user_data,
+                                                  volatile int* cancel_flag, int* out_n_samples) {
+    return chatterbox_synthesize_streaming_impl(ctx, text, chunk_tokens, cb, user_data, cancel_flag,
+                                                nullptr, nullptr, out_n_samples);
+}
+
+extern "C" float* chatterbox_synthesize_streaming_cancelable(
+    struct chatterbox_context* ctx, const char* text, int chunk_tokens,
+    chatterbox_pcm_chunk_callback cb, void* user_data,
+    chatterbox_cancel_callback cancel_cb, void* cancel_user_data, int* out_n_samples) {
+    return chatterbox_synthesize_streaming_impl(ctx, text, chunk_tokens, cb, user_data, nullptr,
+                                                cancel_cb, cancel_user_data, out_n_samples);
 }
 
 struct T3StreamSink {
