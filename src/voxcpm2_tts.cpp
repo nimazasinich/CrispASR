@@ -3007,7 +3007,11 @@ static void causal_conv1d(const float* weight, const float* bias, const float* x
     const bool use_transpose = (in_per_grp > 1 && ksize > 1);
     if (!use_transpose) {
 #if defined(_OPENMP)
+#if defined(_MSC_VER)
+#pragma omp parallel for schedule(static)
+#else
 #pragma omp parallel for collapse(2) schedule(static)
+#endif
 #endif
         for (int oc_abs = 0; oc_abs < out_ch; oc_abs++) {
             for (int ot = 0; ot < T_out; ot++) {
@@ -3036,7 +3040,11 @@ static void causal_conv1d(const float* weight, const float* bias, const float* x
     // (each [oc, ic_per_grp, ksize] block stays self-contained per group).
     std::vector<float> w_kio((size_t)ksize * (size_t)out_ch * (size_t)in_per_grp);
 #if defined(_OPENMP)
+#if defined(_MSC_VER)
+#pragma omp parallel for schedule(static)
+#else
 #pragma omp parallel for collapse(2) schedule(static)
+#endif
 #endif
     for (int k = 0; k < ksize; k++) {
         for (int oc = 0; oc < out_ch; oc++) {
@@ -3061,7 +3069,11 @@ static void causal_conv1d(const float* weight, const float* bias, const float* x
     }
 
 #if defined(_OPENMP)
+#if defined(_MSC_VER)
+#pragma omp parallel for schedule(static)
+#else
 #pragma omp parallel for collapse(2) schedule(static)
+#endif
 #endif
     for (int oc_abs = 0; oc_abs < out_ch; oc_abs++) {
         for (int ot = 0; ot < T_out; ot++) {
@@ -3141,7 +3153,11 @@ static void causal_transposed_conv1d(const float* weight, const float* bias, con
         // W2[(oc*ksize + k), ic] from weight[(ic*out_ch + oc)*ksize + k]
         std::vector<float> W2((size_t)M * in_ch);
 #if defined(_OPENMP)
+#if defined(_MSC_VER)
+#pragma omp parallel for schedule(static)
+#else
 #pragma omp parallel for collapse(2) schedule(static)
+#endif
 #endif
         for (int oc = 0; oc < out_ch; oc++) {
             for (int k = 0; k < ksize; k++) {
@@ -3190,7 +3206,11 @@ static void causal_transposed_conv1d(const float* weight, const float* bias, con
     // floats below. Auto-vectorisation makes the dot ~4-8× faster on M1.
     std::vector<float> w_kio((size_t)ksize * (size_t)out_ch * (size_t)in_ch);
 #if defined(_OPENMP)
+#if defined(_MSC_VER)
+#pragma omp parallel for schedule(static)
+#else
 #pragma omp parallel for collapse(2) schedule(static)
+#endif
 #endif
     for (int k = 0; k < ksize; k++) {
         for (int oc = 0; oc < out_ch; oc++) {
@@ -3213,7 +3233,11 @@ static void causal_transposed_conv1d(const float* weight, const float* bias, con
     }
 
 #if defined(_OPENMP)
+#if defined(_MSC_VER)
+#pragma omp parallel for schedule(static)
+#else
 #pragma omp parallel for collapse(2) schedule(static)
+#endif
 #endif
     for (int oc = 0; oc < out_ch; oc++) {
         for (int ot = 0; ot < T_out; ot++) {
@@ -4498,7 +4522,11 @@ static void vae_strided_conv1d(const float* weight, const float* bias, const flo
 
     // Scalar fallback (cache-unfriendly for large in_ch but correct on all platforms).
 #if defined(_OPENMP)
+#if defined(_MSC_VER)
+#pragma omp parallel for schedule(static)
+#else
 #pragma omp parallel for collapse(2) schedule(static)
+#endif
 #endif
     for (int oc = 0; oc < out_ch; oc++) {
         for (int ot = 0; ot < T_out; ot++) {
