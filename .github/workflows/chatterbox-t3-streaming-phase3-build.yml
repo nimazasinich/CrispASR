@@ -8,6 +8,7 @@ on:
       - chatterbox-stream-worker-lifetime
       - chatterbox-stream-cancel-acceptance
       - windows-vulkan-warning-clean
+      - windows-vulkan-warning-rootfix
   workflow_dispatch:
 
 permissions:
@@ -15,7 +16,7 @@ permissions:
 
 jobs:
   build-windows-vulkan-warning-clean:
-    name: Windows Vulkan warning-clean
+    name: Windows Vulkan warning-rootfix
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v6
@@ -103,28 +104,20 @@ jobs:
           type cli-build.log
           if not "%BUILD_RC%"=="0" exit /b %BUILD_RC%
 
-      - name: Reject known warning noise
+      - name: Reject all MSVC compiler warnings
         shell: pwsh
         run: |
-          $patterns = @(
-            'warning C4003',
-            'warning C4319',
-            'warning C4849',
-            'warning D9002'
-          )
           $logs = @('test-build.log','cli-build.log')
           $hits = foreach ($log in $logs) {
             if (Test-Path $log) {
-              foreach ($p in $patterns) {
-                Select-String -Path $log -SimpleMatch $p
-              }
+              Select-String -Path $log -Pattern 'warning [A-Z]+[0-9]{4}'
             }
           }
           if ($hits) {
             $hits | ForEach-Object { Write-Host $_.Line }
-            throw "Known MSVC warning noise reappeared"
+            throw "MSVC warning-rootfix gate failed"
           }
-          Write-Host "Known warning set is clean: C4003 C4319 C4849 D9002"
+          Write-Host "MSVC warning-rootfix gate PASS: zero compiler warnings"
 
       - name: Package and hash
         shell: pwsh
@@ -153,6 +146,6 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: crispasr-windows-x86_64-vulkan-t3stream-phase3-warning-clean
+          name: crispasr-windows-x86_64-vulkan-t3stream-phase3-warning-rootfix
           path: release/crispasr-windows-x86_64-vulkan-t3stream-phase3.zip
           if-no-files-found: error
