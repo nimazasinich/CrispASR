@@ -1,6 +1,9 @@
 cmake_minimum_required(VERSION 3.14...3.28) # for add_link_options and implicit target directories.
 
-project("ggml" C CXX ASM)
+project("ggml" C CXX)
+if (NOT MSVC)
+    enable_language(ASM)
+endif()
 
 ### GGML Version
 set(GGML_VERSION_MAJOR 0)

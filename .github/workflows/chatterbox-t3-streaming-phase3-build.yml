@@ -78,7 +78,10 @@ jobs:
             -DGGML_CUDA=OFF ^
             -DGGML_NATIVE=OFF ^
             -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON ^
-            -DCRISPASR_BUILD_TESTS=ON
+            -DCRISPASR_BUILD_TESTS=ON > configure.log 2>&1
+          set CONFIG_RC=%ERRORLEVEL%
+          type configure.log
+          if not "%CONFIG_RC%"=="0" exit /b %CONFIG_RC%
 
       - name: Build and run T3 chunk tests
         shell: cmd
@@ -104,20 +107,25 @@ jobs:
           type cli-build.log
           if not "%BUILD_RC%"=="0" exit /b %BUILD_RC%
 
-      - name: Reject all MSVC compiler warnings
+      - name: Reject configure and MSVC warnings
         shell: pwsh
         run: |
-          $logs = @('test-build.log','cli-build.log')
-          $hits = foreach ($log in $logs) {
+          $compilerLogs = @('test-build.log','cli-build.log')
+          $compilerHits = foreach ($log in $compilerLogs) {
             if (Test-Path $log) {
               Select-String -Path $log -Pattern 'warning [A-Z]+[0-9]{4}'
             }
           }
-          if ($hits) {
-            $hits | ForEach-Object { Write-Host $_.Line }
-            throw "MSVC warning-rootfix gate failed"
+          $cmakeHits = @()
+          if (Test-Path 'configure.log') {
+            $cmakeHits = Select-String -Path 'configure.log' -Pattern '^CMake (Deprecation )?Warning'
           }
-          Write-Host "MSVC warning-rootfix gate PASS: zero compiler warnings"
+          $hits = @($compilerHits) + @($cmakeHits)
+          if ($hits.Count -gt 0) {
+            $hits | ForEach-Object { Write-Host $_.Line }
+            throw "Windows warning-rootfix gate failed"
+          }
+          Write-Host "Warning-rootfix gate PASS: zero MSVC and CMake warnings"
 
       - name: Package and hash
         shell: pwsh

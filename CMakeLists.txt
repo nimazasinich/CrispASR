@@ -306,10 +306,8 @@ endif()
 if (MSVC)
     set(MSVC_WARNING_FLAGS
         /wd4101  # Unreferenced local variable
-        /wd4005  # Macro redefinition
         /wd4065  # switch statement contains 'default' but no 'case' labels
         /wd4267  # Conversion from 'size_t' to a smaller type, possible loss of data
-        /wd4244  # Conversion from one type to another type, possible loss of ata
         /wd4805  # Unsafe mix of type
         /wd4305  # Truncation from 'type1' to 'type2' (often double to float)
         /wd4996  # Function or variable may be unsafe/deprecated
