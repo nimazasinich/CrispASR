@@ -267,15 +267,16 @@ public:
         const char* s3_env = std::getenv("CRISPASR_CHATTERBOX_STREAM");
         const bool t3_stream = t3_env && t3_env[0] && t3_env[0] != '0' &&
                                s3_env && s3_env[0] && s3_env[0] != '0';
+        auto cancel_trampoline = [](void* data) -> int {
+            return (*static_cast<crispasr_cancel_callback*>(data))() ? 1 : 0;
+        };
         float* full = nullptr;
         if (t3_stream) {
-            auto cancel_trampoline = [](void* data) -> int {
-                return (*static_cast<crispasr_cancel_callback*>(data))() ? 1 : 0;
-            };
             full = chatterbox_synthesize_t3_streaming(ctx_, text.c_str(), 24, trampoline, &cb,
                                                        cancel_trampoline, &cancelled, &n);
         } else {
-            full = chatterbox_synthesize_streaming(ctx_, text.c_str(), 24, trampoline, &cb, nullptr, &n);
+            full = chatterbox_synthesize_streaming_cancelable(ctx_, text.c_str(), 24, trampoline, &cb,
+                                                              cancel_trampoline, &cancelled, &n);
         }
         chatterbox_pcm_free(full);
     }
