@@ -1718,19 +1718,18 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
             };
 
             // Worker thread: synthesize all sentences, enqueueing chunks as
-            // they are produced. Captures by value the bits it needs so it
-            // outlives the handler scope (the provider keeps `sq` alive).
-            std::thread worker([&backend, &model_mutex, sentences, rp, is_voice_clone, silence_s16, true_streaming,
-                                push_pcm, enqueue, sq, t0]() {
+            // they are produced. Keep the thread joinable and tie its lifetime
+            // to httplib's content-provider resource releaser. This avoids a
+            // detached worker outliving backend/model_mutex during server shutdown.
+            auto worker = std::make_shared<std::thread>(
+                [&backend, &model_mutex, sentences, rp, is_voice_clone, silence_s16, true_streaming,
+                 push_pcm, enqueue, sq, t0]() {
                 auto is_cancelled = [&] {
                     std::lock_guard<std::mutex> lk(sq->m);
                     return sq->cancelled;
                 };
-                // The worker is detached: any exception escaping this lambda would
-                // call std::terminate and kill the whole server (and leave `done`
-                // unset → a hung request). Catch everything, mark the stream
-                // failed+done, and let the provider end it cleanly. (model_mutex is
-                // released by RAII during unwind.)
+                // Catch everything so the provider can terminate cleanly and
+                // model_mutex is released by RAII during unwind.
                 try {
                     std::lock_guard<std::mutex> lock(model_mutex);
                     // TEST-ONLY (CRISPASR_TEST_STREAM_THROW): force a worker
@@ -1783,7 +1782,6 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
                 const double el = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
                 fprintf(stderr, "crispasr-server: streaming synthesis finished in %.2fs\n", el);
             });
-            worker.detach();
 
             // Capture the httplib connection probe while the response provider is active.
             // Without this, disconnects before first PCM are invisible until the first
@@ -1848,6 +1846,18 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
                     return false;
                 }
                 return true;
+            },
+            [sq, worker](bool /*success*/) {
+                // Response teardown is the synchronization point for the worker.
+                // On disconnect/failure, force cancellation and wake any producer
+                // blocked on queue backpressure before joining.
+                {
+                    std::lock_guard<std::mutex> lk(sq->m);
+                    sq->cancelled = true;
+                }
+                sq->cv.notify_all();
+                if (worker && worker->joinable())
+                    worker->join();
             });
             return;
         }
