@@ -1,0 +1,79 @@
+name: Windows MSVC Vulkan warning-clean
+
+on:
+  push:
+    branches:
+      - windows-msvc-warning-cleanup
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  warning-clean:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.ref }}
+          submodules: recursive
+
+      - name: Install Vulkan SDK
+        shell: pwsh
+        run: |
+          $ver = (Invoke-RestMethod -Uri "https://vulkan.lunarg.com/sdk/latest.json").windows
+          $url = "https://sdk.lunarg.com/sdk/download/$ver/windows/vulkan_sdk.exe"
+          Invoke-WebRequest -Uri $url -OutFile vulkan_sdk.exe
+          Start-Process -FilePath .\vulkan_sdk.exe -ArgumentList "--accept-licenses","--default-answer","--confirm-command","install" -Wait
+          $sdk = "C:\VulkanSDK\$ver"
+          "VULKAN_SDK=$sdk" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "$sdk\Bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+
+      - name: Configure and build with MSVC/Vulkan
+        shell: cmd
+        run: |
+          for /f "tokens=*" %%i in ('"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath') do set VSINSTALL=%%i
+          call "%VSINSTALL%\VC\Auxiliary\Build\vcvars64.bat"
+
+          cmake -S . -B build -G Ninja ^
+            -DCMAKE_BUILD_TYPE=Release ^
+            -DGGML_VULKAN=ON ^
+            -DGGML_CUDA=OFF ^
+            -DGGML_NATIVE=OFF ^
+            -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON ^
+            -DCRISPASR_BUILD_TESTS=ON > configure.log 2>&1
+          set CONFIG_RC=%ERRORLEVEL%
+          type configure.log
+          if not "%CONFIG_RC%"=="0" exit /b %CONFIG_RC%
+
+          cmake --build build --target crispasr-cli -j %NUMBER_OF_PROCESSORS% > build.log 2>&1
+          set BUILD_RC=%ERRORLEVEL%
+          type build.log
+          if not "%BUILD_RC%"=="0" exit /b %BUILD_RC%
+
+      - name: Enforce zero warnings
+        shell: pwsh
+        run: |
+          $all = @()
+          if (Test-Path configure.log) { $all += Get-Content configure.log }
+          if (Test-Path build.log) { $all += Get-Content build.log }
+
+          $warnings = @($all | Where-Object {
+            $_ -match '(?i)\bwarning\b'
+          })
+
+          if ($warnings.Count -gt 0) {
+            Write-Host "Found $($warnings.Count) warning line(s):"
+            $warnings | ForEach-Object { Write-Host $_ }
+            throw "Windows/MSVC warning-clean gate failed."
+          }
+
+          Write-Host "ZERO WARNINGS: PASS"
+
+      - name: Verify target binary
+        shell: pwsh
+        run: |
+          $exe = Get-ChildItem build -Recurse -Filter crispasr.exe | Select-Object -First 1
+          if (-not $exe) { throw "crispasr.exe not found" }
+          Write-Host "Binary: $($exe.FullName)"
+          Write-Host "HEAD: $(git rev-parse HEAD)"
