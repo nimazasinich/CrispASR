@@ -17,6 +17,7 @@
 #include <functional>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 // Forward declaration — defined in cli.cpp. We intentionally reuse the
@@ -158,6 +159,7 @@ public:
     // backend produces audio, with the last chunk flagged is_final=true.
     // `pcm` is mono float32 at `tts_sample_rate()`.
     using crispasr_pcm_stream_callback = std::function<void(const float* pcm, int n_samples, bool is_final)>;
+    using crispasr_cancel_callback = std::function<bool()>;
 
     // Synthesize with streaming output. Default implementation falls back to
     // the whole-clip synthesize() and emits it as a single final chunk.
@@ -167,6 +169,12 @@ public:
         auto v = synthesize(text, p);
         if (!v.empty())
             cb(v.data(), (int)v.size(), true);
+    }
+
+    virtual void synthesize_streaming_cancelable(const std::string& text, const whisper_params& p,
+                                                  crispasr_pcm_stream_callback cb,
+                                                  crispasr_cancel_callback /*cancelled*/) {
+        synthesize_streaming(text, p, std::move(cb));
     }
 
     // Sample rate of `synthesize()` output PCM. Defaults to 24 kHz since most

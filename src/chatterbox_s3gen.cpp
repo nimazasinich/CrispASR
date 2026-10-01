@@ -4357,8 +4357,10 @@ struct chatterbox_s3gen_streamer {
     int decoded_chunks = 0;
     bool finished = false;
     volatile int* cancel_flag = nullptr;
+    chatterbox_s3gen_cancel_callback cancel_cb = nullptr;
+    void* cancel_data = nullptr;
 
-    bool cancelled() const { return cancel_flag && *cancel_flag; }
+    bool cancelled() const { return (cancel_flag && *cancel_flag) || (cancel_cb && cancel_cb(cancel_data)); }
 };
 
 extern "C" struct chatterbox_s3gen_streamer* chatterbox_s3gen_streamer_create(
@@ -4388,6 +4390,14 @@ extern "C" void chatterbox_s3gen_streamer_free(struct chatterbox_s3gen_streamer*
 extern "C" void chatterbox_s3gen_streamer_set_cancel_flag(struct chatterbox_s3gen_streamer* st, volatile int* flag) {
     if (st)
         st->cancel_flag = flag;
+}
+
+extern "C" void chatterbox_s3gen_streamer_set_cancel_callback(struct chatterbox_s3gen_streamer* st,
+                                                                chatterbox_s3gen_cancel_callback cb, void* user_data) {
+    if (st) {
+        st->cancel_cb = cb;
+        st->cancel_data = user_data;
+    }
 }
 
 extern "C" int chatterbox_s3gen_streamer_append(struct chatterbox_s3gen_streamer* st, const int32_t* tokens,

@@ -230,10 +230,27 @@ int chatterbox_dump_t3_next_logits(struct chatterbox_context* ctx, const char* t
 // chatterbox_pcm_free. Callback signature matches qwen3 streaming.
 typedef void (*chatterbox_pcm_chunk_callback)(const float* pcm, int n_samples, int is_final, void* user_data);
 typedef chatterbox_pcm_chunk_callback chatterbox_pcm_stream_callback;
+typedef int (*chatterbox_token_chunk_callback)(const int32_t* tokens, int n_tokens, void* user_data);
+typedef int (*chatterbox_cancel_callback)(void* user_data);
+
+// Incremental T3 decode with one KV state. Chunks contain only stable speech
+// tokens; EOS and terminal silence padding are withheld. The returned full
+// token sequence follows chatterbox_synthesize_tokens() and is caller-freed.
+int32_t* chatterbox_synthesize_token_chunks(struct chatterbox_context* ctx, const char* text, int chunk_tokens,
+                                             chatterbox_token_chunk_callback cb, void* user_data,
+                                             chatterbox_cancel_callback cancel_cb, void* cancel_user_data,
+                                             int* out_n_tokens, int* out_complete);
 
 float* chatterbox_synthesize_streaming(struct chatterbox_context* ctx, const char* text, int chunk_tokens,
                                        chatterbox_pcm_chunk_callback cb, void* user_data, volatile int* cancel_flag,
                                        int* out_n_samples);
+
+// Experimental opt-in path: incremental T3/KV decode into the existing S3Gen streamer.
+// The callback returns nonzero to continue. Cancel query returns nonzero to stop.
+float* chatterbox_synthesize_t3_streaming(struct chatterbox_context* ctx, const char* text, int chunk_tokens,
+                                          chatterbox_pcm_chunk_callback cb, void* user_data,
+                                          chatterbox_cancel_callback cancel_cb, void* cancel_user_data,
+                                          int* out_n_samples);
 
 #ifdef __cplusplus
 }

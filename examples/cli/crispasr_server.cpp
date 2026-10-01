@@ -1753,9 +1753,10 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
                         if (is_cancelled())
                             break;
                         if (true_streaming) {
-                            backend->synthesize_streaming(
+                            backend->synthesize_streaming_cancelable(
                                 sentences[i], rp,
-                                [&](const float* pcm, int n_samples, bool /*is_final*/) { push_pcm(pcm, n_samples); });
+                                [&](const float* pcm, int n_samples, bool /*is_final*/) { push_pcm(pcm, n_samples); },
+                                is_cancelled);
                         } else {
                             std::vector<float> chunk = backend->synthesize(sentences[i], rp);
                             if (!chunk.empty())

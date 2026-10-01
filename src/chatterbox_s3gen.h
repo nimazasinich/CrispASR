@@ -107,6 +107,9 @@ void chatterbox_s3gen_streamer_free(struct chatterbox_s3gen_streamer* st);
 // Optional cooperative cancel: when *flag becomes non-zero, flush/finish
 // return promptly without further CFM/HiFT work.
 void chatterbox_s3gen_streamer_set_cancel_flag(struct chatterbox_s3gen_streamer* st, volatile int* flag);
+typedef int (*chatterbox_s3gen_cancel_callback)(void* user_data);
+void chatterbox_s3gen_streamer_set_cancel_callback(struct chatterbox_s3gen_streamer* st,
+                                                  chatterbox_s3gen_cancel_callback cb, void* user_data);
 
 int chatterbox_s3gen_streamer_append(struct chatterbox_s3gen_streamer* st, const int32_t* tokens, int n_tokens);
 

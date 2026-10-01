@@ -16,6 +16,7 @@
 #include "chatterbox_s3gen.h"
 #include "chatterbox_ve.h"
 #include "chatterbox_text_prep.h"
+#include "chatterbox_t3_stream_chunks.h"
 #include "core/attention.h"
 #include "core/audio_resample.h"
 #include "core/bpe.h"
@@ -3294,10 +3295,16 @@ extern "C" int32_t* chatterbox_dump_text_tokens(struct chatterbox_context* ctx, 
     return out;
 }
 
-extern "C" int32_t* chatterbox_synthesize_tokens(struct chatterbox_context* ctx, const char* text, int* out_n) {
+static int32_t* synthesize_tokens_impl(struct chatterbox_context* ctx, const char* text, int* out_n,
+                                       int chunk_tokens, chatterbox_token_chunk_callback on_chunk, void* chunk_data,
+                                       chatterbox_cancel_callback cancel_cb, void* cancel_data, int* out_complete,
+                                       int64_t request_start_us = 0) {
     if (!ctx || !text || !out_n)
         return nullptr;
     *out_n = 0;
+    if (out_complete)
+        *out_complete = 0;
+    const int64_t stream_start_us = on_chunk ? (request_start_us ? request_start_us : ggml_time_us()) : 0;
 
     const bool is_gpt2 = (ctx->hp.arch == "chatterbox_turbo" || ctx->hp.arch == "kartoffelbox");
 
@@ -3452,10 +3459,23 @@ extern "C" int32_t* chatterbox_synthesize_tokens(struct chatterbox_context* ctx,
     // 7. AR decode loop with CFG
     std::vector<int32_t> speech_tokens;
     speech_tokens.reserve(max_speech);
+    int64_t chunk_callback_us = 0;
+    ChatterboxT3Chunker chunker(chunk_tokens, [&](const int32_t* tokens, int count) {
+        const int64_t started = ggml_time_us();
+        const bool keep_going = on_chunk && on_chunk(tokens, count, chunk_data) != 0;
+        chunk_callback_us += ggml_time_us() - started;
+        return keep_going;
+    });
     int speech_pos = 1;
+    bool cancelled = false;
+    bool decode_failed = false;
 
     int64_t t_dec0 = ggml_time_us();
     for (int step = 0; step < max_speech; step++) {
+        if (cancel_cb && cancel_cb(cancel_data)) {
+            cancelled = true;
+            break;
+        }
         // Blend logits with CFG: logits = cond + cfg * (cond - uncond)
         const int V = (int)ctx->hp.speech_vocab_size;
         std::vector<float> blended(V);
@@ -3510,6 +3530,8 @@ extern "C" int32_t* chatterbox_synthesize_tokens(struct chatterbox_context* ctx,
         }
 
         speech_tokens.push_back(tok);
+        if (on_chunk && speech_tokens.size() == 1)
+            fprintf(stderr, "[T3_STREAM] first_token_ms=%.1f\n", (ggml_time_us() - stream_start_us) / 1e3);
 
         // Build embedding for this token
         std::vector<float> tok_embed;
@@ -3532,6 +3554,7 @@ extern "C" int32_t* chatterbox_synthesize_tokens(struct chatterbox_context* ctx,
                 logits = nullptr;
                 free(logits_uncond);
                 logits_uncond = nullptr;
+                decode_failed = true;
                 break;
             }
             n_past++;
@@ -3545,6 +3568,7 @@ extern "C" int32_t* chatterbox_synthesize_tokens(struct chatterbox_context* ctx,
             }
             if (!logits) {
                 fprintf(stderr, "chatterbox: decode step %d failed\n", step);
+                decode_failed = true;
                 break;
             }
             n_past++;
@@ -3555,13 +3579,28 @@ extern "C" int32_t* chatterbox_synthesize_tokens(struct chatterbox_context* ctx,
                 n_past_cfg++;
             }
         }
+        // Forward has completed and the next-step logits have been read back.
+        // The token and the KV state are now stable across a consumer callback.
+        const int max_valid_tok = is_gpt2 ? (int)ctx->hp.speech_vocab_size - 2 : 6561;
+        if (on_chunk && tok >= 0 && tok < max_valid_tok) {
+            cancelled = !chunker.push(tok);
+            if (cancelled)
+                break;
+        }
     }
     if (logits)
         free(logits);
     if (logits_uncond)
         free(logits_uncond);
-    ctx->last_perf.t_decode_us = ggml_time_us() - t_dec0;
+    ctx->last_perf.t_decode_us = ggml_time_us() - t_dec0 - chunk_callback_us;
     ctx->last_perf.n_speech_tokens = (int)speech_tokens.size();
+
+    if (!cancelled && !decode_failed && on_chunk && !chunker.finish())
+        cancelled = true;
+    if (cancelled)
+        return nullptr;
+    if (out_complete)
+        *out_complete = decode_failed ? 0 : 1;
 
     if (ctx->params.verbosity >= 1) {
         fprintf(stderr, "chatterbox: AR emitted %zu speech tokens\n", speech_tokens.size());
@@ -3620,6 +3659,21 @@ extern "C" int32_t* chatterbox_synthesize_tokens(struct chatterbox_context* ctx,
     std::memcpy(out, valid.data(), valid.size() * sizeof(int32_t));
     *out_n = (int)valid.size();
     return out;
+}
+
+extern "C" int32_t* chatterbox_synthesize_tokens(struct chatterbox_context* ctx, const char* text, int* out_n) {
+    return synthesize_tokens_impl(ctx, text, out_n, 0, nullptr, nullptr, nullptr, nullptr, nullptr);
+}
+
+extern "C" int32_t* chatterbox_synthesize_token_chunks(struct chatterbox_context* ctx, const char* text,
+                                                        int chunk_tokens, chatterbox_token_chunk_callback cb,
+                                                        void* user_data, chatterbox_cancel_callback cancel_cb,
+                                                        void* cancel_user_data, int* out_n_tokens,
+                                                        int* out_complete) {
+    if (!cb || chunk_tokens <= 0)
+        return nullptr;
+    return synthesize_tokens_impl(ctx, text, out_n_tokens, chunk_tokens, cb, user_data,
+                                  cancel_cb, cancel_user_data, out_complete);
 }
 
 // Internal: run T3 + S3Gen to get mel, return channel-first (80, T_mel)
@@ -3919,6 +3973,130 @@ extern "C" float* chatterbox_synthesize_streaming(struct chatterbox_context* ctx
         return nullptr;
     std::memcpy(out, all_pcm.data(), all_pcm.size() * sizeof(float));
     *out_n_samples = (int)all_pcm.size();
+    return out;
+}
+
+struct T3StreamSink {
+    chatterbox_s3gen_streamer* streamer = nullptr;
+    chatterbox_pcm_chunk_callback pcm_cb = nullptr;
+    void* pcm_data = nullptr;
+    chatterbox_cancel_callback cancel_cb = nullptr;
+    void* cancel_data = nullptr;
+    std::vector<float> pcm;
+    int chunk_tokens = 24;
+    int emitted_tokens = 0;
+    int64_t start_us = 0;
+    bool first_pcm = false;
+    int pcm_windows = 0;
+};
+
+static void t3_stream_emit(T3StreamSink* sink, float* pcm, int n, int final) {
+    if (pcm && n > 0) {
+        if (!sink->first_pcm) {
+            fprintf(stderr, "[T3_STREAM] first_pcm_ms=%.1f\n", (ggml_time_us() - sink->start_us) / 1e3);
+            sink->first_pcm = true;
+        }
+        fprintf(stderr, "[T3_STREAM] pcm_window=%d time_ms=%.1f samples=%d final=%d\n",
+                ++sink->pcm_windows, (ggml_time_us() - sink->start_us) / 1e3, n, final);
+        sink->pcm.insert(sink->pcm.end(), pcm, pcm + n);
+        if (sink->pcm_cb)
+            sink->pcm_cb(pcm, n, final, sink->pcm_data);
+    } else if (final && sink->pcm_cb) {
+        sink->pcm_cb(nullptr, 0, 1, sink->pcm_data);
+    }
+    if (pcm)
+        chatterbox_s3gen_pcm_free(pcm);
+}
+
+static int t3_stream_token_chunk(const int32_t* tokens, int n_tokens, void* user_data) {
+    auto* sink = static_cast<T3StreamSink*>(user_data);
+    if (sink->cancel_cb && sink->cancel_cb(sink->cancel_data))
+        return 0;
+    if (sink->emitted_tokens == 0)
+        fprintf(stderr, "[T3_STREAM] first_chunk_ms=%.1f tokens=%d\n",
+                (ggml_time_us() - sink->start_us) / 1e3, n_tokens);
+    if (chatterbox_s3gen_streamer_append(sink->streamer, tokens, n_tokens) != 0)
+        return 0;
+    sink->emitted_tokens += n_tokens;
+    if (n_tokens == sink->chunk_tokens) {
+        fprintf(stderr, "[T3_STREAM] s3gen_window_start_ms=%.1f tokens=%d\n",
+                (ggml_time_us() - sink->start_us) / 1e3, sink->emitted_tokens);
+        int n = 0;
+        float* pcm = chatterbox_s3gen_streamer_flush(sink->streamer, 0, &n);
+        t3_stream_emit(sink, pcm, n, 0);
+    }
+    return !(sink->cancel_cb && sink->cancel_cb(sink->cancel_data));
+}
+
+extern "C" float* chatterbox_synthesize_t3_streaming(struct chatterbox_context* ctx, const char* text,
+                                                       int chunk_tokens, chatterbox_pcm_chunk_callback cb,
+                                                       void* user_data, chatterbox_cancel_callback cancel_cb,
+                                                       void* cancel_user_data, int* out_n_samples) {
+    if (!ctx || !text || !out_n_samples || !ctx->s3gen_ctx)
+        return nullptr;
+    const int64_t request_start_us = ggml_time_us();
+    fprintf(stderr, "[T3_STREAM] request_start_ms=0\n");
+    *out_n_samples = 0;
+    if (chunk_tokens <= 0)
+        chunk_tokens = 24;
+
+    // Read the same reference voice conditioning as the existing S3Gen streaming path.
+    std::vector<int32_t> pt_buf;
+    std::vector<float> pf_buf, se_buf;
+    if (ctx->conds.gen_prompt_token) {
+        const int n = (int)ctx->conds.gen_prompt_token->ne[0];
+        pt_buf.resize(n);
+        ggml_backend_tensor_get(ctx->conds.gen_prompt_token, pt_buf.data(), 0, (size_t)n * sizeof(int32_t));
+    }
+    int prompt_feat_len = 0;
+    if (ctx->conds.gen_prompt_feat) {
+        prompt_feat_len = (int)ctx->conds.gen_prompt_feat->ne[1];
+        pf_buf.resize((size_t)prompt_feat_len * 80);
+        ggml_backend_tensor_get(ctx->conds.gen_prompt_feat, pf_buf.data(), 0, pf_buf.size() * sizeof(float));
+    }
+    if (ctx->conds.gen_embedding) {
+        se_buf.resize(192);
+        ggml_backend_tensor_get(ctx->conds.gen_embedding, se_buf.data(), 0, 192 * sizeof(float));
+    }
+    chatterbox_s3gen_streamer* st = chatterbox_s3gen_streamer_create(
+        ctx->s3gen_ctx, pt_buf.empty() ? nullptr : pt_buf.data(), (int)pt_buf.size(),
+        pf_buf.empty() ? nullptr : pf_buf.data(), prompt_feat_len,
+        se_buf.empty() ? nullptr : se_buf.data(), ctx->params.cfm_steps, 12.0f);
+    if (!st)
+        return nullptr;
+    chatterbox_s3gen_streamer_set_cancel_callback(st, cancel_cb, cancel_user_data);
+    T3StreamSink sink;
+    sink.streamer = st;
+    sink.pcm_cb = cb;
+    sink.pcm_data = user_data;
+    sink.cancel_cb = cancel_cb;
+    sink.cancel_data = cancel_user_data;
+    sink.chunk_tokens = chunk_tokens;
+    sink.start_us = request_start_us;
+
+    int n_tokens = 0;
+    int complete = 0;
+    int32_t* speech_tokens = synthesize_tokens_impl(ctx, text, &n_tokens, chunk_tokens, t3_stream_token_chunk,
+                                                     &sink, cancel_cb, cancel_user_data, &complete, request_start_us);
+    if (speech_tokens)
+        chatterbox_tokens_free(speech_tokens);
+    fprintf(stderr, "[T3_STREAM] t3_complete_ms=%.1f tokens=%d complete=%d\n",
+            (ggml_time_us() - sink.start_us) / 1e3, sink.emitted_tokens, complete);
+    if (complete && sink.emitted_tokens > 0 && !(cancel_cb && cancel_cb(cancel_user_data))) {
+        int n = 0;
+        float* pcm = chatterbox_s3gen_streamer_finish(st, &n);
+        t3_stream_emit(&sink, pcm, n, 1);
+    }
+    chatterbox_s3gen_streamer_free(st);
+    fprintf(stderr, "[T3_STREAM] synthesis_complete_ms=%.1f pcm_samples=%zu\n",
+            (ggml_time_us() - sink.start_us) / 1e3, sink.pcm.size());
+    if (sink.pcm.empty())
+        return nullptr;
+    float* out = (float*)malloc(sink.pcm.size() * sizeof(float));
+    if (!out)
+        return nullptr;
+    std::memcpy(out, sink.pcm.data(), sink.pcm.size() * sizeof(float));
+    *out_n_samples = (int)sink.pcm.size();
     return out;
 }
 

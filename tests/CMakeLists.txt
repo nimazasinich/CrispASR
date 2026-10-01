@@ -418,6 +418,18 @@ catch_discover_tests(test-chatterbox-text-prep
     PROPERTIES LABELS "unit;chatterbox"
 )
 
+add_executable(test-chatterbox-t3-stream-chunks
+    test-chatterbox-t3-stream-chunks.cpp
+)
+target_include_directories(test-chatterbox-t3-stream-chunks PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+)
+target_link_libraries(test-chatterbox-t3-stream-chunks PRIVATE Catch2::Catch2WithMain)
+catch_discover_tests(test-chatterbox-t3-stream-chunks
+    TEST_SPEC "[unit]"
+    PROPERTIES LABELS "unit;chatterbox;t3-stream"
+)
+
 # ─── test - punc - resolve — Catch2 unit tests for the shared --punc-model
 # resolver (CLI/server parity). Pure string mapping, header-only, no model load.
 add_executable(test-punc-resolve

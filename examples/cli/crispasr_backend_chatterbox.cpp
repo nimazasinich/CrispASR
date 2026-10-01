@@ -212,6 +212,12 @@ public:
 
     void synthesize_streaming(const std::string& text, const whisper_params& params,
                               crispasr_pcm_stream_callback cb) override {
+        synthesize_streaming_cancelable(text, params, std::move(cb), [] { return false; });
+    }
+
+    void synthesize_streaming_cancelable(const std::string& text, const whisper_params& params,
+                                          crispasr_pcm_stream_callback cb,
+                                          crispasr_cancel_callback cancelled) override {
         if (!ctx_ || text.empty())
             return;
         if (!s3gen_loaded_) {
@@ -256,8 +262,21 @@ public:
                 (*fn)(pcm, n_samples, is_final != 0);
         };
         int n = 0;
-        // chunk_tokens=24 matches upstream Turbo stream() default.
-        float* full = chatterbox_synthesize_streaming(ctx_, text.c_str(), 24, trampoline, &cb, nullptr, &n);
+        // Keep the validated S3Gen streaming chunk size for this experiment.
+        const char* t3_env = std::getenv("CRISPASR_CHATTERBOX_T3_STREAM");
+        const char* s3_env = std::getenv("CRISPASR_CHATTERBOX_STREAM");
+        const bool t3_stream = t3_env && t3_env[0] && t3_env[0] != '0' &&
+                               s3_env && s3_env[0] && s3_env[0] != '0';
+        float* full = nullptr;
+        if (t3_stream) {
+            auto cancel_trampoline = [](void* data) -> int {
+                return (*static_cast<crispasr_cancel_callback*>(data))() ? 1 : 0;
+            };
+            full = chatterbox_synthesize_t3_streaming(ctx_, text.c_str(), 24, trampoline, &cb,
+                                                       cancel_trampoline, &cancelled, &n);
+        } else {
+            full = chatterbox_synthesize_streaming(ctx_, text.c_str(), 24, trampoline, &cb, nullptr, &n);
+        }
         chatterbox_pcm_free(full);
     }
 
