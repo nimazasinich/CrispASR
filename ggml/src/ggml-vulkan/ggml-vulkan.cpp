@@ -4755,6 +4755,10 @@ static void ggml_vk_load_shaders(vk_device& device) {
             sizeof(vk_op_binary_push_constants), {1, 1, 1}, { 0, state.N, state.K, batch_N, block_size }, 1, true);
     }
 
+#ifdef _MSC_VER
+#pragma warning(push)
+#pragma warning(disable : 4003) // intentional empty macro suffix in the non-BDA shader path
+#endif
 #define IM2COL(bda) \
     ggml_vk_create_pipeline(device, device->pipeline_im2col_f32, "im2col_f32", im2col_f32 ## bda ## _len, im2col_f32 ## bda ## _data, "main", 2, sizeof(vk_op_im2col_push_constants), {512, 1, 1}, { device->subgroup_size }, 1, true);   \
     ggml_vk_create_pipeline(device, device->pipeline_im2col_3d_f32, "im2col_3d_f32", im2col_3d_f32 ## bda ## _len, im2col_3d_f32 ## bda ## _data, "main", 2, sizeof(vk_op_im2col_3d_push_constants), {512, 1, 1}, { 512 }, 1, true);      \
@@ -4927,6 +4931,9 @@ static void ggml_vk_load_shaders(vk_device& device) {
         }
 #undef CREATE_CONV
 #undef CREATE_CONVS
+#ifdef _MSC_VER
+#pragma warning(pop)
+#endif
     }
 
     ggml_vk_create_pipeline(device, device->pipeline_conv2d_dw_whcn_f32, "conv2d_dw_whcn_f32", conv2d_dw_whcn_f32_len, conv2d_dw_whcn_f32_data, "main", 3, sizeof(vk_op_conv2d_dw_push_constants), {512, 1, 1}, {}, 1);
@@ -7699,7 +7706,10 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
     }
 
     // Reserve extra storage in the N dimension for the Y matrix, so we can avoid bounds-checking
-    uint32_t padded_n = qy_needs_dequant ? ROUNDUP_POW2(ne11, pipeline->wg_denoms[1]) : ne11;
+    uint32_t padded_n = qy_needs_dequant
+                            ? static_cast<uint32_t>(ROUNDUP_POW2(static_cast<uint64_t>(ne11),
+                                                                 static_cast<uint64_t>(pipeline->wg_denoms[1])))
+                            : ne11;
     const uint64_t x_ne = ggml_nelements(src0);
     // 128 elements per Q8_1 x4 block
     const uint64_t y_ne = padded_n * ne10 * ne12 * ne13;
@@ -8533,7 +8543,10 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
         pipeline = ggml_vk_get_64b_indexing_pipeline(ctx, pipeline);
     }
     // Reserve extra storage in the N dimension for the Y matrix, so we can avoid bounds-checking
-    uint32_t padded_n = qy_needs_dequant ? ROUNDUP_POW2(ne11, pipeline->wg_denoms[1]) :ne11;
+    uint32_t padded_n = qy_needs_dequant
+                            ? static_cast<uint32_t>(ROUNDUP_POW2(static_cast<uint64_t>(ne11),
+                                                                 static_cast<uint64_t>(pipeline->wg_denoms[1])))
+                            : ne11;
     const uint64_t x_ne = ggml_nelements(src0);
     const uint64_t y_ne = padded_n * ne10 * ne12 * ne13;
     const uint64_t d_ne = ggml_nelements(dst);
@@ -11149,7 +11162,9 @@ static uint32_t ggml_vk_rms_num_partials(ggml_backend_vk_context * ctx, const gg
 
 static uint32_t ggml_vk_rms_partials_size(ggml_backend_vk_context * ctx, const ggml_tensor *node) {
     const uint32_t num_partials = ggml_vk_rms_num_partials(ctx, node);
-    const uint32_t num_bytes = ROUNDUP_POW2(num_partials * sizeof(uint32_t), ctx->device->partials_binding_alignment);
+    const uint32_t num_bytes = static_cast<uint32_t>(
+        ROUNDUP_POW2(static_cast<size_t>(num_partials) * sizeof(uint32_t),
+                     static_cast<size_t>(ctx->device->partials_binding_alignment)));
     return num_bytes;
 }
 
