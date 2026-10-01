@@ -145,6 +145,15 @@ if (WIN32)
     add_compile_definitions(_USE_MATH_DEFINES NOMINMAX)
 endif()
 
+# Keep Windows CI signal clean without hiding unrelated diagnostics.
+# These are known MSVC-only noise in bundled ggml/wav2vec code:
+# C4003 macro arity diagnostics in ggml-vulkan macro plumbing,
+# C4319 zero-extension diagnostics in ggml-vulkan bit masks,
+# C4849 unsupported OpenMP 'collapse' clause in wav2vec2-ggml.
+if (MSVC)
+    add_compile_options(/wd4003 /wd4319 /wd4849)
+endif()
+
 # Wire COHERE_MKL into ggml's BLAS backend before add_subdirectory(ggml).
 # This must happen here so the values are visible to the ggml subproject.
 if (COHERE_MKL)
