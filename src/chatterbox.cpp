@@ -11,7 +11,9 @@
 //   - Character tokenizer for text input
 //   - Stub hooks for S3Gen + vocoder (separate file later)
 
+#ifndef _USE_MATH_DEFINES
 #define _USE_MATH_DEFINES
+#endif
 #include "chatterbox.h"
 #include "chatterbox_s3gen.h"
 #include "chatterbox_ve.h"
