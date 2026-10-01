@@ -7,13 +7,15 @@ on:
       - chatterbox-stream-cancel-fix
       - chatterbox-stream-worker-lifetime
       - chatterbox-stream-cancel-acceptance
+      - windows-vulkan-warning-clean
   workflow_dispatch:
 
 permissions:
   contents: read
 
 jobs:
-  build-windows-vulkan:
+  build-windows-vulkan-warning-clean:
+    name: Windows Vulkan warning-clean
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v6
@@ -82,8 +84,10 @@ jobs:
         run: |
           for /f "tokens=*" %%i in ('"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath') do set VSINSTALL=%%i
           call "%VSINSTALL%\VC\Auxiliary\Build\vcvars64.bat"
-          cmake --build build --target test-chatterbox-t3-stream-chunks -j %NUMBER_OF_PROCESSORS%
-          if errorlevel 1 exit /b %errorlevel%
+          cmake --build build --target test-chatterbox-t3-stream-chunks -j %NUMBER_OF_PROCESSORS% > test-build.log 2>&1
+          set BUILD_RC=%ERRORLEVEL%
+          type test-build.log
+          if not "%BUILD_RC%"=="0" exit /b %BUILD_RC%
           for /f "delims=" %%f in ('dir /s /b build\test-chatterbox-t3-stream-chunks.exe') do set TESTEXE=%%f
           if not defined TESTEXE exit /b 2
           "%TESTEXE%" "[unit][chatterbox][t3-stream]"
@@ -94,8 +98,33 @@ jobs:
         run: |
           for /f "tokens=*" %%i in ('"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath') do set VSINSTALL=%%i
           call "%VSINSTALL%\VC\Auxiliary\Build\vcvars64.bat"
-          cmake --build build --target crispasr-cli -j %NUMBER_OF_PROCESSORS%
-          if errorlevel 1 exit /b %errorlevel%
+          cmake --build build --target crispasr-cli -j %NUMBER_OF_PROCESSORS% > cli-build.log 2>&1
+          set BUILD_RC=%ERRORLEVEL%
+          type cli-build.log
+          if not "%BUILD_RC%"=="0" exit /b %BUILD_RC%
+
+      - name: Reject known warning noise
+        shell: pwsh
+        run: |
+          $patterns = @(
+            'warning C4003',
+            'warning C4319',
+            'warning C4849',
+            'warning D9002'
+          )
+          $logs = @('test-build.log','cli-build.log')
+          $hits = foreach ($log in $logs) {
+            if (Test-Path $log) {
+              foreach ($p in $patterns) {
+                Select-String -Path $log -SimpleMatch $p
+              }
+            }
+          }
+          if ($hits) {
+            $hits | ForEach-Object { Write-Host $_.Line }
+            throw "Known MSVC warning noise reappeared"
+          }
+          Write-Host "Known warning set is clean: C4003 C4319 C4849 D9002"
 
       - name: Package and hash
         shell: pwsh
@@ -124,6 +153,6 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: crispasr-windows-x86_64-vulkan-t3stream-phase3
+          name: crispasr-windows-x86_64-vulkan-t3stream-phase3-warning-clean
           path: release/crispasr-windows-x86_64-vulkan-t3stream-phase3.zip
           if-no-files-found: error
