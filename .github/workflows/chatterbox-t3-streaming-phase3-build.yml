@@ -68,19 +68,24 @@ jobs:
             -DCRISPASR_BUILD_TESTS=ON
 
       - name: Build and run T3 chunk tests
-        shell: pwsh
+        shell: cmd
         run: |
-          cmake --build build --target test-chatterbox-t3-stream-chunks -j $env:NUMBER_OF_PROCESSORS
-          $test = Get-ChildItem build -Recurse -Filter "test-chatterbox-t3-stream-chunks.exe" | Select-Object -First 1
-          if (-not $test) { throw "test-chatterbox-t3-stream-chunks.exe not found" }
-          & $test.FullName "[unit][chatterbox][t3-stream]"
-          if ($LASTEXITCODE -ne 0) { throw "T3 chunk Catch2 tests failed: $LASTEXITCODE" }
+          for /f "tokens=*" %%i in ('"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath') do set VSINSTALL=%%i
+          call "%VSINSTALL%\VC\Auxiliary\Build\vcvars64.bat"
+          cmake --build build --target test-chatterbox-t3-stream-chunks -j %NUMBER_OF_PROCESSORS%
+          if errorlevel 1 exit /b %errorlevel%
+          for /f "delims=" %%f in ('dir /s /b build\test-chatterbox-t3-stream-chunks.exe') do set TESTEXE=%%f
+          if not defined TESTEXE exit /b 2
+          "%TESTEXE%" "[unit][chatterbox][t3-stream]"
+          if errorlevel 1 exit /b %errorlevel%
 
       - name: Build Windows Vulkan CLI
-        shell: pwsh
+        shell: cmd
         run: |
-          cmake --build build --target crispasr-cli -j $env:NUMBER_OF_PROCESSORS
-          if ($LASTEXITCODE -ne 0) { throw "crispasr-cli build failed: $LASTEXITCODE" }
+          for /f "tokens=*" %%i in ('"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath') do set VSINSTALL=%%i
+          call "%VSINSTALL%\VC\Auxiliary\Build\vcvars64.bat"
+          cmake --build build --target crispasr-cli -j %NUMBER_OF_PROCESSORS%
+          if errorlevel 1 exit /b %errorlevel%
 
       - name: Package and hash
         shell: pwsh
