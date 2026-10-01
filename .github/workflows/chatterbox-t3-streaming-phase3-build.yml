@@ -1,0 +1,114 @@
+name: Chatterbox T3 streaming Phase 3 build
+
+on:
+  push:
+    branches:
+      - chatterbox-t3-streaming-phase3
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-windows-vulkan:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.ref }}
+          submodules: recursive
+
+      - name: Verify scheduler + S3Gen + T3 streaming sources
+        shell: pwsh
+        run: |
+          if (-not (Select-String -Path ggml\src\ggml-backend.cpp -Pattern "ggml_backend_sched_apply_src_mutations" -Quiet)) {
+            throw "T3 Vulkan scheduler rewire fix missing"
+          }
+          if (-not (Select-String -Path src\chatterbox_s3gen.h -Pattern "chatterbox_s3gen_streamer_create" -Quiet)) {
+            throw "S3GenStreamer API missing"
+          }
+          if (-not (Test-Path src\chatterbox_t3_stream_chunks.h)) {
+            throw "T3 chunker header missing"
+          }
+          $cpp = Get-Content src\chatterbox.cpp -Raw
+          $hdr = Get-Content src\chatterbox.h -Raw
+          $be = Get-Content examples\cli\crispasr_backend_chatterbox.cpp -Raw
+          if ($cpp -notmatch "chatterbox_synthesize_t3_streaming") { throw "T3 streaming implementation missing" }
+          if ($hdr -notmatch "chatterbox_synthesize_token_chunks") { throw "T3 token chunk API missing" }
+          if ($be -notmatch "CRISPASR_CHATTERBOX_T3_STREAM") { throw "T3 streaming feature gate missing" }
+          if ($be -notmatch "CRISPASR_CHATTERBOX_STREAM") { throw "S3Gen streaming feature gate missing" }
+          $n = (Select-String -Path src\chatterbox.cpp -Pattern 'float\* chatterbox_synthesize_t3_streaming' -AllMatches).Count
+          if ($n -ne 1) { throw "expected exactly one chatterbox_synthesize_t3_streaming definition, found $n" }
+          Write-Host "HEAD $(git rev-parse HEAD)"
+
+      - name: Install Vulkan SDK
+        shell: pwsh
+        run: |
+          $ver = (Invoke-RestMethod -Uri "https://vulkan.lunarg.com/sdk/latest.json").windows
+          Write-Host "Vulkan SDK $ver"
+          $url = "https://sdk.lunarg.com/sdk/download/$ver/windows/vulkan_sdk.exe"
+          Invoke-WebRequest -Uri $url -OutFile vulkan_sdk.exe
+          Start-Process -FilePath .\vulkan_sdk.exe -ArgumentList "--accept-licenses","--default-answer","--confirm-command","install" -Wait
+          $sdk = "C:\VulkanSDK\$ver"
+          "VULKAN_SDK=$sdk" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "$sdk\Bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+          Set-Content -Path vulkan-sdk-version.txt -Value $ver
+
+      - name: Configure
+        shell: cmd
+        run: |
+          for /f "tokens=*" %%i in ('"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath') do set VSINSTALL=%%i
+          call "%VSINSTALL%\VC\Auxiliary\Build\vcvars64.bat"
+          cmake -S . -B build -G Ninja ^
+            -DCMAKE_BUILD_TYPE=Release ^
+            -DGGML_VULKAN=ON ^
+            -DGGML_CUDA=OFF ^
+            -DGGML_NATIVE=OFF ^
+            -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON ^
+            -DCRISPASR_BUILD_TESTS=ON
+
+      - name: Build and run T3 chunk tests
+        shell: pwsh
+        run: |
+          cmake --build build --target test-chatterbox-t3-stream-chunks -j $env:NUMBER_OF_PROCESSORS
+          $test = Get-ChildItem build -Recurse -Filter "test-chatterbox-t3-stream-chunks.exe" | Select-Object -First 1
+          if (-not $test) { throw "test-chatterbox-t3-stream-chunks.exe not found" }
+          & $test.FullName "[unit][chatterbox][t3-stream]"
+          if ($LASTEXITCODE -ne 0) { throw "T3 chunk Catch2 tests failed: $LASTEXITCODE" }
+
+      - name: Build Windows Vulkan CLI
+        shell: pwsh
+        run: |
+          cmake --build build --target crispasr-cli -j $env:NUMBER_OF_PROCESSORS
+          if ($LASTEXITCODE -ne 0) { throw "crispasr-cli build failed: $LASTEXITCODE" }
+
+      - name: Package and hash
+        shell: pwsh
+        run: |
+          $out = "release\crispasr-windows-x86_64-vulkan-t3stream-phase3"
+          New-Item -ItemType Directory -Force $out | Out-Null
+          Copy-Item build\bin\crispasr.exe $out\
+          Get-ChildItem build\bin\*.dll | Where-Object { $_.Name -notlike 'Catch2*' } | Copy-Item -Destination $out\
+          if (-not (Test-Path "$out\crispasr.exe")) { throw "crispasr.exe missing" }
+          if (-not (Test-Path "$out\ggml-vulkan.dll")) { throw "ggml-vulkan.dll missing" }
+          Copy-Item vulkan-sdk-version.txt $out -ErrorAction SilentlyContinue
+          git rev-parse HEAD | Set-Content "$out\git-head.txt"
+          Set-Content -Path "$out\T3_STREAMING.txt" -Value @(
+            "S3Gen streaming: CRISPASR_CHATTERBOX_STREAM=1",
+            "T3 token/KV streaming: CRISPASR_CHATTERBOX_T3_STREAM=1",
+            "T3 GPU: CRISPASR_CHATTERBOX_T3_GPU=1",
+            "experimental Phase 3; default OFF"
+          )
+          $lines = foreach ($f in Get-ChildItem $out -File) {
+            $h = Get-FileHash $f.FullName -Algorithm SHA256
+            "{0}  {1}" -f $h.Hash, $f.Name
+          }
+          $lines | Set-Content "$out\SHA256SUMS.txt"
+          Get-Content "$out\SHA256SUMS.txt"
+          Compress-Archive -Path $out -DestinationPath release\crispasr-windows-x86_64-vulkan-t3stream-phase3.zip -CompressionLevel Optimal
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: crispasr-windows-x86_64-vulkan-t3stream-phase3
+          path: release/crispasr-windows-x86_64-vulkan-t3stream-phase3.zip
+          if-no-files-found: error
