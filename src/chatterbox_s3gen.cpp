@@ -2519,7 +2519,10 @@ static std::vector<float> cfm_euler_solve(chatterbox_s3gen_context* c,
                                           const std::vector<float>& spk_emb, // (80,) projected speaker embedding
                                           const float* init_noise_cf,        // (80, T) full initial noise or null
                                           int T_mel, int n_steps, float cfg_rate, bool meanflow = false,
-                                          bool dump_stages = false) {
+                                          bool dump_stages = false,
+                                          chatterbox_s3gen_cancel_callback cancel_cb = nullptr,
+                                          void* cancel_data = nullptr) {
+    auto is_cancelled = [&]() { return cancel_cb && cancel_cb(cancel_data); };
     // Generate time schedule
     std::vector<float> t_span(n_steps + 1);
     for (int i = 0; i <= n_steps; i++) {
@@ -2619,6 +2622,11 @@ static std::vector<float> cfm_euler_solve(chatterbox_s3gen_context* c,
 
     // Euler ODE steps
     for (int step = 0; step < n_steps; step++) {
+        if (is_cancelled()) {
+            if (c->verbosity >= 1)
+                fprintf(stderr, "[CHATTERBOX_CANCEL] S3Gen observed cancellation before CFM step %d\n", step);
+            return {};
+        }
         float t_val = t_span[step];
         float r_val = t_span[step + 1];
         float dt = r_val - t_val;
@@ -2737,6 +2745,14 @@ static std::vector<float> cfm_euler_solve(chatterbox_s3gen_context* c,
                 }
             }
 
+            // A submitted graph must finish safely, but once it returns do not
+            // read outputs or start another graph if the client has cancelled.
+            if (is_cancelled()) {
+                if (c->verbosity >= 1)
+                    fprintf(stderr, "[CHATTERBOX_CANCEL] S3Gen observed cancellation after CFM graph %d\n", step);
+                return {};
+            }
+
             // Output: (T, 80, 2) — batch 0 = cond, batch 1 = uncond.
             ggml_tensor* out_b2 = ggml_graph_get_tensor(gf_b2, "denoiser_out_b2");
             if (step == 0 && c->verbosity >= 1) {
@@ -2776,6 +2792,8 @@ static std::vector<float> cfm_euler_solve(chatterbox_s3gen_context* c,
         ggml_cgraph* gf = build_graph_unet1d(c, T_mel);
 
         auto run_denoiser = [&](const std::vector<float>& input) -> std::vector<float> {
+            if (is_cancelled())
+                return {};
             ggml_backend_sched_reset(c->sched);
             s3gen_maybe_pin_graph_to_cpu(c, gf, s3gen_subgraph::unet);
             if (!ggml_backend_sched_alloc_graph(c->sched, gf)) {
@@ -2796,6 +2814,11 @@ static std::vector<float> cfm_euler_solve(chatterbox_s3gen_context* c,
                                     mask_data.size() * sizeof(float));
             if (ggml_backend_sched_graph_compute(c->sched, gf) != GGML_STATUS_SUCCESS) {
                 fprintf(stderr, "s3gen: UNet1D compute failed\n");
+                return {};
+            }
+            if (is_cancelled()) {
+                if (c->verbosity >= 1)
+                    fprintf(stderr, "[CHATTERBOX_CANCEL] S3Gen observed cancellation after single CFM graph %d\n", step);
                 return {};
             }
             ggml_tensor* out = ggml_graph_get_tensor(gf, "denoiser_out");
@@ -3707,7 +3730,10 @@ static bool chatterbox_s3gen_compute_gen_mel(struct chatterbox_s3gen_context* ct
                                              int n_speech_tokens, const int32_t* prompt_tokens, int n_prompt_tokens,
                                              const float* prompt_feat, int prompt_feat_len, const float* spk_embedding,
                                              int n_cfm_steps, const float* init_noise_cf, int init_noise_T_total,
-                                             std::vector<float>& gen_mel_out, int* out_T_mel, int finalize = 1) {
+                                             std::vector<float>& gen_mel_out, int* out_T_mel, int finalize = 1,
+                                             chatterbox_s3gen_cancel_callback cancel_cb = nullptr,
+                                             void* cancel_data = nullptr) {
+    auto is_cancelled = [&]() { return cancel_cb && cancel_cb(cancel_data); };
     if (!ctx || !speech_tokens || n_speech_tokens <= 0)
         return false;
     if (out_T_mel)
@@ -3743,6 +3769,11 @@ static bool chatterbox_s3gen_compute_gen_mel(struct chatterbox_s3gen_context* ct
     ctx->last_perf.t_encoder_us = ggml_time_us() - t_enc0;
     if (h.empty())
         return false;
+    if (is_cancelled()) {
+        if (ctx->verbosity >= 1)
+            fprintf(stderr, "[CHATTERBOX_CANCEL] S3Gen observed cancellation after encoder\n");
+        return false;
+    }
 
     constexpr int kPreLookaheadLen = 3;
     constexpr int kTokenMelRatio = 2;
@@ -3863,10 +3894,15 @@ static bool chatterbox_s3gen_compute_gen_mel(struct chatterbox_s3gen_context* ct
     }
     int64_t t_cfm0 = ggml_time_us();
     std::vector<float> mel = cfm_euler_solve(ctx, h, cond, spk_proj, init_noise_cf, T_mel_total, actual_steps, cfg,
-                                             is_meanflow, dump_stages);
+                                             is_meanflow, dump_stages, cancel_cb, cancel_data);
     ctx->last_perf.t_cfm_us = ggml_time_us() - t_cfm0;
     ctx->last_perf.n_cfm_steps = actual_steps;
     ctx->last_perf.T_mel = T_mel_gen;
+    if (mel.empty() || is_cancelled()) {
+        if (is_cancelled() && ctx->verbosity >= 1)
+            fprintf(stderr, "[CHATTERBOX_CANCEL] S3Gen stopped before mel extraction\n");
+        return false;
+    }
 
     // 5. Extract generated portion (skip prompt region)
     std::vector<float> gen_mel(80 * T_mel_gen);
@@ -4363,6 +4399,11 @@ struct chatterbox_s3gen_streamer {
     bool cancelled() const { return (cancel_flag && *cancel_flag) || (cancel_cb && cancel_cb(cancel_data)); }
 };
 
+static int chatterbox_s3gen_streamer_cancel_query(void* data) {
+    auto* st = static_cast<chatterbox_s3gen_streamer*>(data);
+    return st && st->cancelled() ? 1 : 0;
+}
+
 extern "C" struct chatterbox_s3gen_streamer* chatterbox_s3gen_streamer_create(
     struct chatterbox_s3gen_context* s3gen, const int32_t* prompt_tokens, int n_prompt_tokens,
     const float* prompt_feat, int prompt_feat_len, const float* spk_embedding, int n_cfm_steps, float crossfade_ms) {
@@ -4485,29 +4526,35 @@ static std::vector<float> streamer_decode_available(chatterbox_s3gen_streamer* s
     }
 
     int T_mel = 0;
-    float* mel_cf = chatterbox_s3gen_synthesize_mel_with_noise_ex(
-        st->s3gen, st->token_buffer.data(), (int)st->token_buffer.size(),
-        st->prompt_tokens.empty() ? nullptr : st->prompt_tokens.data(), (int)st->prompt_tokens.size(),
-        st->prompt_feat.empty() ? nullptr : st->prompt_feat.data(), st->prompt_feat_len,
-        st->spk_embedding.empty() ? nullptr : st->spk_embedding.data(), st->n_cfm_steps, init_noise.data(),
-        T_mel_total, finalize ? 1 : 0, &T_mel);
-    if (!mel_cf || T_mel <= 0) {
-        if (mel_cf)
-            chatterbox_s3gen_pcm_free(mel_cf);
-        return {};
-    }
-    if (st->cancelled()) {
-        chatterbox_s3gen_pcm_free(mel_cf);
+    std::vector<float> mel_cf;
+    if (!chatterbox_s3gen_compute_gen_mel(
+            st->s3gen, st->token_buffer.data(), (int)st->token_buffer.size(),
+            st->prompt_tokens.empty() ? nullptr : st->prompt_tokens.data(), (int)st->prompt_tokens.size(),
+            st->prompt_feat.empty() ? nullptr : st->prompt_feat.data(), st->prompt_feat_len,
+            st->spk_embedding.empty() ? nullptr : st->spk_embedding.data(), st->n_cfm_steps, init_noise.data(),
+            T_mel_total, mel_cf, &T_mel, finalize ? 1 : 0,
+            chatterbox_s3gen_streamer_cancel_query, st) ||
+        T_mel <= 0 || st->cancelled()) {
         return {};
     }
 
+    // Final safe boundary before the monolithic HiFT graph. If cancellation
+    // arrives while HiFT is in flight, let that one graph finish and discard it.
     float* source_ptr = nullptr;
     int n_source = 0;
     int n_wav = 0;
     float* wav = chatterbox_s3gen_vocode_with_cache_source(
-        st->s3gen, mel_cf, T_mel, st->hift_cache_source.empty() ? nullptr : st->hift_cache_source.data(),
+        st->s3gen, mel_cf.data(), T_mel, st->hift_cache_source.empty() ? nullptr : st->hift_cache_source.data(),
         (int)st->hift_cache_source.size(), &source_ptr, &n_source, &n_wav);
-    chatterbox_s3gen_pcm_free(mel_cf);
+    if (st->cancelled()) {
+        if (source_ptr)
+            chatterbox_s3gen_pcm_free(source_ptr);
+        if (wav)
+            chatterbox_s3gen_pcm_free(wav);
+        if (st->s3gen->verbosity >= 1)
+            fprintf(stderr, "[CHATTERBOX_CANCEL] S3Gen discarded completed HiFT graph after cancellation\n");
+        return {};
+    }
     if (source_ptr && n_source > 0) {
         st->hift_cache_source.assign(source_ptr, source_ptr + n_source);
         chatterbox_s3gen_pcm_free(source_ptr);
