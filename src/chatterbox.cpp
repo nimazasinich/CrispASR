@@ -2074,8 +2074,10 @@ static float* run_t3_kv(chatterbox_context* c, const float* embeds, int n_tokens
         }
     }
 
-    ggml_cgraph* gf = build_graph_t3_kv(c, n_past, n_tokens, use_kv_k, use_kv_v);
+    // Restore previous source mutations before reusing the T3 graph metadata.
+    // (Hermes semantic-safe: historical semantic-fix.patch ordering on 883e951b)
     ggml_backend_sched_reset(c->sched);
+    ggml_cgraph* gf = build_graph_t3_kv(c, n_past, n_tokens, use_kv_k, use_kv_v);
     if (!ggml_backend_sched_alloc_graph(c->sched, gf)) {
         fprintf(stderr, "chatterbox: failed to alloc T3 graph\n");
         return nullptr;
